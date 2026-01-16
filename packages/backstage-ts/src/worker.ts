@@ -101,16 +101,20 @@ export class Worker {
     taskName: string,
     payload: unknown,
     options: EnqueueOptions = {}
-  ): Promise<string> {
+  ): Promise<string | null> {
     return this.stream.enqueue(taskName, payload, options);
   }
 
   async schedule(
     taskName: string,
     payload: unknown,
-    delayMs: number
-  ): Promise<string> {
-    return this.stream.enqueue(taskName, payload, { delay: delayMs });
+    delayMs: number,
+    options: Omit<EnqueueOptions, 'delay'> = {}
+  ): Promise<string | null> {
+    return this.stream.enqueue(taskName, payload, {
+      ...options,
+      delay: delayMs,
+    });
   }
 
   async start(): Promise<void> {

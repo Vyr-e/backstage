@@ -206,10 +206,31 @@ export const DEFAULT_WORKER_CONFIG: Required<Omit<WorkerConfig, 'workerId'>> & {
  * Options for enqueueing a task.
  */
 export interface EnqueueOptions {
-  /** Priority level */
+  /** Priority level (used with default queues) */
   priority?: Priority;
+  /** Target queue (overrides priority) */
+  queue?: string;
   /** Delay before execution in milliseconds */
   delay?: number;
+  /** Deduplication settings */
+  dedupe?: {
+    /** Unique key for this job instance */
+    key: string;
+    /** Deduplication window in ms (default: 1 hour) */
+    ttl?: number;
+  };
+  /** Maximum retry attempts for this job (overrides worker default) */
+  attempts?: number;
+  /** Backoff strategy for retries */
+  backoff?: {
+    type: 'fixed' | 'exponential';
+    /** Base delay in ms */
+    delay: number;
+    /** Maximum delay cap for exponential backoff */
+    maxDelay?: number;
+  };
+  /** Job processing timeout in ms */
+  timeout?: number;
 }
 
 // =============================================================================

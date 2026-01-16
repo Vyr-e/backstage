@@ -4,7 +4,8 @@ Background worker system using Redis Streams with at-least-once delivery.
 
 ## Features
 
-- **Multi-Priority Queues** - urgent, default, low priority streams
+- **Multi-Priority Queues** - urgent, default, low + custom queues
+- **Job Deduplication** - prevent duplicate submissions with key + TTL
 - **Workflow Chaining** - return `{ next, delay, payload }` from handlers
 - **Cron Scheduling** - run tasks on cron schedules
 - **PEL Reclaimer** - automatic recovery of stuck messages
@@ -15,9 +16,8 @@ Background worker system using Redis Streams with at-least-once delivery.
 ## Quick Start
 
 ```typescript
-import { Worker, Queue, CronTask, Scheduler } from '@backstage/core';
+import { Worker } from '@backstage/core';
 
-// Create a worker
 const worker = new Worker({
   host: 'localhost',
   port: 6379,
@@ -33,7 +33,6 @@ worker.on('email.receipt', async (data) => {
   console.log('Sending receipt:', data);
 });
 
-// Start
 await worker.start();
 ```
 
@@ -43,8 +42,59 @@ await worker.start();
 // Immediate
 await worker.enqueue('payment.process', { orderId: '123' });
 
+// With priority
+await worker.enqueue('task', data, { priority: Priority.URGENT });
+
 // Delayed
 await worker.schedule('reminder.send', data, 60000);
+
+// Custom queue
+await worker.enqueue('task', data, { queue: 'notifications' });
+```
+
+## Job Deduplication
+
+Prevent duplicate job submissions (e.g., double-click protection):
+
+```typescript
+// First call succeeds, returns message ID
+const id1 = await worker.enqueue('order.create', order, {
+  dedupe: { key: `order-${order.id}`, ttl: 60000 },
+});
+
+// Second call within TTL returns null (skipped)
+const id2 = await worker.enqueue('order.create', order, {
+  dedupe: { key: `order-${order.id}`, ttl: 60000 },
+});
+// id2 === null
+```
+
+## Enhanced Job Options
+
+```typescript
+await worker.enqueue('payment.process', order, {
+  attempts: 3, // Max retries for this job
+  backoff: {
+    // Retry strategy
+    type: 'exponential', // 'fixed' or 'exponential'
+    delay: 1000, // Base delay in ms
+    maxDelay: 30000, // Cap for exponential
+  },
+  timeout: 10000, // Processing timeout in ms
+});
+```
+
+## Custom Queues
+
+```typescript
+import { Queue, Stream } from '@backstage/core';
+
+const notifQueue = new Queue('notifications', { priority: 1 });
+const analyticsQueue = new Queue('analytics', { priority: 10 });
+
+const stream = new Stream(redis, 'my-group', {
+  queues: [notifQueue, analyticsQueue],
+});
 ```
 
 ## Cron Scheduler
@@ -62,22 +112,16 @@ const scheduler = new Scheduler({
 await scheduler.start();
 ```
 
-## Queue Utilities
+## Broadcast
+
+Send messages to all workers:
 
 ```typescript
-import { inspect, purgeQueue, numPendingTasks } from '@backstage/core';
+import { Broadcast } from '@backstage/core';
 
-const info = await inspect(redis, queues);
-console.log(info.totalPending);
-
-await purgeQueue(redis, queue);
-```
-
-## Docker
-
-```bash
-docker build -t backstage-worker .
-docker run -e REDIS_HOST=redis backstage-worker
+const broadcast = new Broadcast({ worker });
+await broadcast.initialize();
+await broadcast.send('cache.invalidate', { key: 'users' });
 ```
 
 ## Environment Variables
@@ -96,27 +140,34 @@ docker run -e REDIS_HOST=redis backstage-worker
 ### Worker
 
 ```typescript
-new Worker(config?: WorkerConfig)
-worker.on(taskName, handler, options?)
-worker.enqueue(taskName, payload, options?)
-worker.schedule(taskName, payload, delayMs)
+new Worker(config?: WorkerConfig, loggerConfig?: LoggerConfig)
+worker.on<T>(taskName, handler, options?)
+worker.enqueue(taskName, payload, options?)  // Returns string | null
+worker.schedule(taskName, payload, delayMs, options?)
 worker.start()
 worker.stop()
+worker.redis      // Access Redis client
+worker.workerId   // Get worker ID
+```
+
+### EnqueueOptions
+
+```typescript
+{
+  priority?: Priority;           // URGENT, DEFAULT, LOW
+  queue?: string;                // Custom queue name
+  delay?: number;                // Delay in ms
+  dedupe?: { key, ttl? };        // Deduplication
+  attempts?: number;             // Max retries
+  backoff?: { type, delay, maxDelay? };
+  timeout?: number;              // Processing timeout
+}
 ```
 
 ### Queue
 
 ```typescript
 new Queue(name, { priority, softTimeout, hardTimeout, maxRetries });
-```
-
-### Task
-
-```typescript
-const task = new Task(handler, { name, queue, maxRetries });
-task.enqueue(data);
-task.enqueueAfterDelay(delayMs, data);
-task.broadcast(data);
 ```
 
 ### CronTask
@@ -126,10 +177,11 @@ new CronTask(schedule, taskName, queue?, args?)
 // schedule: "minute hour dayOfMonth month dayOfWeek"
 ```
 
-### Scheduler
+### Broadcast
 
 ```typescript
-new Scheduler({ schedules, queues, logLevel });
-scheduler.start();
-scheduler.stop();
+new Broadcast({ worker }); // Recommended
+new Broadcast({ redis, workerId }); // Standalone
+broadcast.initialize();
+broadcast.send(taskName, payload);
 ```

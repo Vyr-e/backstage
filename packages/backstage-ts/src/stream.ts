@@ -4,13 +4,12 @@
 
 import {
   Priority,
-  getStreamKey,
-  getScheduledKey,
   STREAM_PREFIX,
   type RedisClient,
   type StreamMessageData,
   type EnqueueOptions,
 } from './types';
+import { Queue } from './queue';
 
 /**
  * Lua script for atomic scheduled task processing.
@@ -33,15 +32,24 @@ local processed = 0
 for _, taskData in ipairs(tasks) do
     local ok, task = pcall(cjson.decode, taskData)
     if ok and task then
-        local priority = task.priority or defaultPriority
-        local streamKey = prefix .. ':' .. priority
+        local streamKey = task.streamKey or (prefix .. ':' .. (task.priority or defaultPriority))
         
-        redis.call('XADD', streamKey, '*',
-            'taskName', task.taskName or '',
-            'payload', task.payload or '{}',
-            'enqueuedAt', tostring(task.enqueuedAt or 0)
-        )
+        local args = {streamKey, '*', 'taskName', task.taskName or '', 'payload', task.payload or '{}', 'enqueuedAt', tostring(task.enqueuedAt or 0)}
         
+        if task.attempts then
+            table.insert(args, 'attempts')
+            table.insert(args, tostring(task.attempts))
+        end
+        if task.backoff then
+            table.insert(args, 'backoff')
+            table.insert(args, task.backoff)
+        end
+        if task.timeout then
+            table.insert(args, 'timeout')
+            table.insert(args, tostring(task.timeout))
+        end
+        
+        redis.call('XADD', unpack(args))
         redis.call('ZREM', zsetKey, taskData)
         processed = processed + 1
     end
@@ -53,6 +61,8 @@ return processed
 export interface StreamConfig {
   prefix?: string;
   defaultPriority?: Priority;
+  /** Custom queues to initialize (in addition to default priority queues) */
+  queues?: Queue[];
 }
 
 export class Stream {
@@ -60,6 +70,7 @@ export class Stream {
   private consumerGroup: string;
   private prefix: string;
   private defaultPriority: Priority;
+  private customQueues: Queue[];
 
   constructor(
     redis: RedisClient,
@@ -70,36 +81,75 @@ export class Stream {
     this.consumerGroup = consumerGroup;
     this.prefix = config.prefix ?? STREAM_PREFIX;
     this.defaultPriority = config.defaultPriority ?? Priority.DEFAULT;
+    this.customQueues = config.queues ?? [];
   }
 
   async initialize(): Promise<void> {
+    // Initialize default priority queues
     const priorities = [Priority.URGENT, Priority.DEFAULT, Priority.LOW];
 
     for (const priority of priorities) {
       const streamKey = `${this.prefix}:${priority}`;
-      try {
-        await this.redis.send('XGROUP', [
-          'CREATE',
-          streamKey,
-          this.consumerGroup,
-          '0',
-          'MKSTREAM',
-        ]);
-      } catch (err: unknown) {
-        if (err instanceof Error && !err.message.includes('BUSYGROUP')) {
-          throw err;
-        }
+      await this.createConsumerGroup(streamKey);
+    }
+
+    // Initialize custom queues
+    for (const queue of this.customQueues) {
+      await this.createConsumerGroup(queue.streamKey);
+    }
+  }
+
+  private async createConsumerGroup(streamKey: string): Promise<void> {
+    try {
+      await this.redis.send('XGROUP', [
+        'CREATE',
+        streamKey,
+        this.consumerGroup,
+        '0',
+        'MKSTREAM',
+      ]);
+    } catch (err: unknown) {
+      if (err instanceof Error && !err.message.includes('BUSYGROUP')) {
+        throw err;
       }
     }
   }
 
+  /**
+   * Enqueue a task for processing.
+   * @returns Message ID, or null if deduplicated
+   */
   async enqueue(
     taskName: string,
     payload: unknown,
     options: EnqueueOptions = {}
-  ): Promise<string> {
-    const priority = options.priority ?? this.defaultPriority;
-    const delay = options.delay;
+  ): Promise<string | null> {
+    // Handle deduplication
+    if (options.dedupe) {
+      const dedupeKey = `${this.prefix}:dedupe:${options.dedupe.key}`;
+      const ttlSeconds = Math.ceil((options.dedupe.ttl ?? 3600000) / 1000);
+      const set = await this.redis.send('SET', [
+        dedupeKey,
+        '1',
+        'NX',
+        'EX',
+        String(ttlSeconds),
+      ]);
+      if (!set) {
+        return null; // Duplicate, skip
+      }
+    }
+
+    // Determine stream key
+    let streamKey: string;
+    if (options.queue) {
+      // Custom queue name provided
+      streamKey = `${this.prefix}:${options.queue}`;
+    } else {
+      // Use priority (default or specified)
+      const priority = options.priority ?? this.defaultPriority;
+      streamKey = `${this.prefix}:${priority}`;
+    }
 
     const messageData: StreamMessageData = {
       taskName,
@@ -107,17 +157,26 @@ export class Stream {
       enqueuedAt: Date.now(),
     };
 
+    const delay = options.delay;
+
     if (delay && delay > 0) {
       const executeAt = Date.now() + delay;
       const scheduledKey = `${this.prefix}:scheduled`;
-      const data = JSON.stringify({ ...messageData, priority });
+      const data = JSON.stringify({
+        ...messageData,
+        streamKey, // Store the target stream key
+        priority: options.priority ?? this.defaultPriority,
+        attempts: options.attempts,
+        backoff: options.backoff ? JSON.stringify(options.backoff) : undefined,
+        timeout: options.timeout,
+      });
 
       await this.redis.send('ZADD', [scheduledKey, String(executeAt), data]);
       return `scheduled:${executeAt}`;
     }
 
-    const streamKey = `${this.prefix}:${priority}`;
-    const messageId = await this.redis.send('XADD', [
+    // Build XADD arguments with optional job metadata
+    const xaddArgs: string[] = [
       streamKey,
       '*',
       'taskName',
@@ -126,8 +185,20 @@ export class Stream {
       messageData.payload,
       'enqueuedAt',
       String(messageData.enqueuedAt),
-    ]);
+    ];
 
+    // Add optional job metadata
+    if (options.attempts !== undefined) {
+      xaddArgs.push('attempts', String(options.attempts));
+    }
+    if (options.backoff) {
+      xaddArgs.push('backoff', JSON.stringify(options.backoff));
+    }
+    if (options.timeout !== undefined) {
+      xaddArgs.push('timeout', String(options.timeout));
+    }
+
+    const messageId = await this.redis.send('XADD', xaddArgs);
     return messageId as string;
   }
 
@@ -151,15 +222,35 @@ export class Stream {
     return (result as number) ?? 0;
   }
 
+  /**
+   * Get all stream keys in priority order.
+   * Default queues first, then custom queues sorted by priority.
+   */
   getStreamKeys(): string[] {
-    return [
+    const defaultKeys = [
       `${this.prefix}:${Priority.URGENT}`,
       `${this.prefix}:${Priority.DEFAULT}`,
       `${this.prefix}:${Priority.LOW}`,
     ];
+
+    // Sort custom queues by priority (lower = higher priority)
+    const sortedCustom = [...this.customQueues].sort(
+      (a, b) => a.priority - b.priority
+    );
+    const customKeys = sortedCustom.map((q) => q.streamKey);
+
+    return [...defaultKeys, ...customKeys];
   }
 
   getPrefix(): string {
     return this.prefix;
+  }
+
+  /**
+   * Add a custom queue at runtime.
+   */
+  async addQueue(queue: Queue): Promise<void> {
+    await this.createConsumerGroup(queue.streamKey);
+    this.customQueues.push(queue);
   }
 }

@@ -39,13 +39,13 @@ export interface BackstageInstance {
     taskName: string,
     payload: unknown,
     queueName?: string
-  ): Promise<string>;
+  ): Promise<string | null>;
   schedule(
     taskName: string,
     payload: unknown,
     delayMs: number,
     queueName?: string
-  ): Promise<string>;
+  ): Promise<string | null>;
   broadcast(taskName: string, payload: unknown): Promise<string>;
 }
 
@@ -100,8 +100,9 @@ export class Task<TData = unknown, TResult = void | WorkflowInstruction> {
 
   /**
    * Enqueue this task for immediate execution.
+   * @returns Message ID, or null if deduplicated
    */
-  async enqueue(data?: TData): Promise<string> {
+  async enqueue(data?: TData): Promise<string | null> {
     if (!this.backstage) {
       throw new Error('Task not bound to a Backstage instance');
     }
@@ -112,8 +113,12 @@ export class Task<TData = unknown, TResult = void | WorkflowInstruction> {
 
   /**
    * Schedule this task for delayed execution.
+   * @returns Message ID, or null if deduplicated
    */
-  async enqueueAfterDelay(delayMs: number, data?: TData): Promise<string> {
+  async enqueueAfterDelay(
+    delayMs: number,
+    data?: TData
+  ): Promise<string | null> {
     if (!this.backstage) {
       throw new Error('Task not bound to a Backstage instance');
     }
@@ -124,8 +129,9 @@ export class Task<TData = unknown, TResult = void | WorkflowInstruction> {
 
   /**
    * Schedule this task for a specific time.
+   * @returns Message ID, or null if deduplicated
    */
-  async enqueueAt(date: Date, data?: TData): Promise<string> {
+  async enqueueAt(date: Date, data?: TData): Promise<string | null> {
     const delayMs = date.getTime() - Date.now();
     if (delayMs < 0) {
       return this.enqueue(data);
