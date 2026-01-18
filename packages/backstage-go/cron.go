@@ -1,3 +1,5 @@
+// Package backstage cron parser.
+// Handles parsing of cron expressions for scheduled tasks.
 package backstage
 
 import (

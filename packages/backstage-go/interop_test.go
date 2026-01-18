@@ -95,6 +95,9 @@ func TestInteropBroadcastFormat(t *testing.T) {
 }
 
 func TestInteropPriorityStreams(t *testing.T) {
+	client := newTestClient()
+	defer client.Close()
+
 	// Verify stream keys match what TS expects
 	expected := map[Priority]string{
 		PriorityUrgent:  "backstage:urgent",
@@ -103,7 +106,7 @@ func TestInteropPriorityStreams(t *testing.T) {
 	}
 
 	for priority, expectedKey := range expected {
-		key := streamKey(priority)
+		key := client.streamKey(priority)
 		if key != expectedKey {
 			t.Errorf("priority %s: expected '%s', got '%s'", priority, expectedKey, key)
 		}
@@ -111,8 +114,11 @@ func TestInteropPriorityStreams(t *testing.T) {
 }
 
 func TestInteropDeadLetterKey(t *testing.T) {
+	client := newTestClient()
+	defer client.Close()
+
 	// Verify dead letter key format matches TS
-	key := deadLetterKey(PriorityDefault)
+	key := client.deadLetterKey(PriorityDefault)
 	expected := "backstage:default:dead-letter"
 	if key != expected {
 		t.Errorf("expected '%s', got '%s'", expected, key)

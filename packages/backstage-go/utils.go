@@ -1,3 +1,5 @@
+// Package backstage utilities.
+// Helper functions for inspecting queue state, purging data, and other maintenance tasks.
 package backstage
 
 import (
@@ -6,13 +8,15 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// QueueInfo contains statistics about a specific queue.
 type QueueInfo struct {
 	Name       string
-	Pending    int64
-	Scheduled  int64
-	DeadLetter int64
+	Pending    int64 // Number of messages waiting in the stream
+	Scheduled  int64 // Number of tasks scheduled for future execution (in ZSET)
+	DeadLetter int64 // Number of messages in the dead letter queue
 }
 
+// QueuesInfo aggregates statistics for multiple queues.
 type QueuesInfo struct {
 	Queues         []QueueInfo
 	TotalPending   int64
@@ -20,6 +24,7 @@ type QueuesInfo struct {
 	TotalDL        int64
 }
 
+// Inspect retrieves current statistics for the provided list of queues.
 func Inspect(ctx context.Context, rdb *redis.Client, queues []*Queue) (*QueuesInfo, error) {
 	info := &QueuesInfo{}
 
@@ -51,6 +56,8 @@ func NumScheduledTasks(ctx context.Context, rdb *redis.Client, q *Queue) (int64,
 	return rdb.ZCard(ctx, q.ScheduledKey()).Result()
 }
 
+// PurgeQueue removes all messages from the main stream of a queue.
+// WARNING: This deletes unprocessed data.
 func PurgeQueue(ctx context.Context, rdb *redis.Client, q *Queue) (int64, error) {
 	len, err := rdb.XLen(ctx, q.StreamKey()).Result()
 	if err != nil {

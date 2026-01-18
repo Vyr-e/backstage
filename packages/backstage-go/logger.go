@@ -1,3 +1,5 @@
+// Package backstage logger.
+// Provides structured logging using log/slog.
 package backstage
 
 import (

@@ -1,3 +1,5 @@
+// Package backstage queue definitions.
+// Defines Queue structures and standard priority management.
 package backstage
 
 import "fmt"

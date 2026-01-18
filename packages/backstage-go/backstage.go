@@ -1,3 +1,5 @@
+// Package backstage provides a robust, Redis-Streams-based background job processing system.
+// It supports priority queues, delayed scheduling, deduplication, and broadcast messaging.
 package backstage
 
 import (
@@ -44,6 +46,8 @@ type Config struct {
 	DB            int
 	ConsumerGroup string
 	WorkerID      string
+	// Prefix for Redis keys (default: "backstage")
+	Prefix        string
 }
 
 // DefaultConfig returns sensible defaults.
@@ -53,6 +57,7 @@ func DefaultConfig() Config {
 		Port:          6379,
 		DB:            0,
 		ConsumerGroup: "backstage-workers",
+		Prefix:        StreamPrefix,
 	}
 }
 
@@ -69,6 +74,10 @@ type Handler func(ctx context.Context, payload json.RawMessage) (*WorkflowInstru
 
 // New creates a new Backstage client.
 func New(cfg Config) *Client {
+	if cfg.Prefix == "" {
+		cfg.Prefix = StreamPrefix
+	}
+
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
 		Password: cfg.Password,
@@ -88,16 +97,16 @@ func (c *Client) Close() error {
 }
 
 // streamKey returns the stream key for a priority.
-func streamKey(priority Priority) string {
-	return fmt.Sprintf("%s:%s", StreamPrefix, priority)
+func (c *Client) streamKey(priority Priority) string {
+	return fmt.Sprintf("%s:%s", c.config.Prefix, priority)
 }
 
 // scheduledKey returns the scheduled tasks sorted set key.
-func scheduledKey() string {
-	return fmt.Sprintf("%s:scheduled", StreamPrefix)
+func (c *Client) scheduledKey() string {
+	return fmt.Sprintf("%s:scheduled", c.config.Prefix)
 }
 
 // deadLetterKey returns the dead-letter stream key.
-func deadLetterKey(priority Priority) string {
-	return fmt.Sprintf("%s:%s:dead-letter", StreamPrefix, priority)
+func (c *Client) deadLetterKey(priority Priority) string {
+	return fmt.Sprintf("%s:%s:dead-letter", c.config.Prefix, priority)
 }

@@ -1,3 +1,5 @@
+// Package backstage consumer implementation.
+// Handles worker pool management, job processing, and reliability features (reclaiming, dead-letter).
 package backstage
 
 import (
@@ -81,7 +83,7 @@ func (c *Client) initConsumerGroups(ctx context.Context) error {
 	priorities := []Priority{PriorityUrgent, PriorityDefault, PriorityLow}
 
 	for _, p := range priorities {
-		key := streamKey(p)
+		key := c.streamKey(p)
 		err := c.redis.XGroupCreateMkStream(ctx, key, c.config.ConsumerGroup, "0").Err()
 		if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
 			return err
@@ -91,11 +93,12 @@ func (c *Client) initConsumerGroups(ctx context.Context) error {
 	return nil
 }
 
+
 func (c *Client) processLoop(ctx context.Context, cfg ConsumerConfig) error {
 	streams := []string{
-		streamKey(PriorityUrgent),
-		streamKey(PriorityDefault),
-		streamKey(PriorityLow),
+		c.streamKey(PriorityUrgent),
+		c.streamKey(PriorityDefault),
+		c.streamKey(PriorityLow),
 		">", ">", ">",
 	}
 
@@ -221,7 +224,7 @@ func (c *Client) reclaimIdleMessages(ctx context.Context, cfg ConsumerConfig) {
 	priorities := []Priority{PriorityUrgent, PriorityDefault, PriorityLow}
 
 	for _, p := range priorities {
-		key := streamKey(p)
+		key := c.streamKey(p)
 
 		pending, err := c.redis.XPendingExt(ctx, &redis.XPendingExtArgs{
 			Stream: key,
@@ -259,8 +262,8 @@ func (c *Client) reclaimIdleMessages(ctx context.Context, cfg ConsumerConfig) {
 }
 
 func (c *Client) moveToDeadLetter(ctx context.Context, priority Priority, msg redis.XMessage) {
-	dlKey := deadLetterKey(priority)
-	sKey := streamKey(priority)
+	dlKey := c.deadLetterKey(priority)
+	sKey := c.streamKey(priority)
 
 	c.redis.XAdd(ctx, &redis.XAddArgs{
 		Stream: dlKey,
@@ -316,9 +319,9 @@ func (c *Client) processScheduled(ctx context.Context) {
 			now := time.Now().UnixMilli()
 
 			// Use atomic Lua script to prevent race conditions
-			c.redis.Eval(ctx, processScheduledLuaConsumer, []string{scheduledKey()},
+			c.redis.Eval(ctx, processScheduledLuaConsumer, []string{c.scheduledKey()},
 				now,
-				StreamPrefix,
+				c.config.Prefix,
 				string(PriorityDefault),
 			)
 

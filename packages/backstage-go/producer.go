@@ -1,3 +1,5 @@
+// Package backstage producer implementation.
+// Handles enqueueing tasks, scheduling, and broadcasting messages.
 package backstage
 
 import (
@@ -30,19 +32,30 @@ type DedupeConfig struct {
 	TTL time.Duration // Deduplication window (default: 1 hour)
 }
 
-// EnqueueOptions for task enqueueing.
+// EnqueueOptions configuration for task enqueueing.
 type EnqueueOptions struct {
+	// Priority level (Urgent, Default, Low). Defaults to Default.
 	Priority Priority
-	Queue    string        // Custom queue name (overrides Priority)
+	// Queue is a custom queue name. If set, it overrides Priority.
+	Queue    string
+	// Delay specifies how long to wait before the task becomes available for processing.
 	Delay    time.Duration
-	Dedupe   *DedupeConfig // Deduplication settings
-	Attempts int           // Max retry attempts for this job
+	// Dedupe configuration prevents duplicate tasks from being enqueued within a window.
+	Dedupe   *DedupeConfig
+	// Attempts is the maximum number of times the task will be retried if it fails.
+	Attempts int
+	// Backoff configuration for retry delays.
 	Backoff  *BackoffConfig
-	Timeout  time.Duration // Job processing timeout
+	// Timeout is the maximum execution time for the handler.
+	Timeout  time.Duration
 }
 
 // Enqueue adds a task to the queue.
-// Returns empty string if deduplicated.
+// It supports priority levels, custom queues, delayed scheduling, deduplication,
+// and execution options like retries and timeouts.
+//
+// Returns the message ID if successful, or an empty string if the task was
+// deduplicated (skipped).
 func (c *Client) Enqueue(ctx context.Context, taskName string, payload interface{}, opts ...EnqueueOptions) (string, error) {
 	var opt EnqueueOptions
 	if len(opts) > 0 {
@@ -50,8 +63,9 @@ func (c *Client) Enqueue(ctx context.Context, taskName string, payload interface
 	}
 
 	// Handle deduplication
+	// Handle deduplication
 	if opt.Dedupe != nil {
-		dedupeKey := fmt.Sprintf("%s:dedupe:%s", StreamPrefix, opt.Dedupe.Key)
+		dedupeKey := fmt.Sprintf("%s:dedupe:%s", c.config.Prefix, opt.Dedupe.Key)
 		ttl := opt.Dedupe.TTL
 		if ttl == 0 {
 			ttl = time.Hour // Default 1 hour
@@ -68,13 +82,13 @@ func (c *Client) Enqueue(ctx context.Context, taskName string, payload interface
 	// Determine stream key
 	var streamKey string
 	if opt.Queue != "" {
-		streamKey = fmt.Sprintf("%s:%s", StreamPrefix, opt.Queue)
+		streamKey = fmt.Sprintf("%s:%s", c.config.Prefix, opt.Queue)
 	} else {
 		priority := opt.Priority
 		if priority == "" {
 			priority = PriorityDefault
 		}
-		streamKey = fmt.Sprintf("%s:%s", StreamPrefix, priority)
+		streamKey = c.streamKey(priority)
 	}
 
 	payloadBytes, err := json.Marshal(payload)
@@ -125,7 +139,7 @@ func (c *Client) Enqueue(ctx context.Context, taskName string, payload interface
 		}
 
 		data, _ := json.Marshal(scheduledData)
-		err := c.redis.ZAdd(ctx, scheduledKey(), redis.Z{
+		err := c.redis.ZAdd(ctx, c.scheduledKey(), redis.Z{
 			Score:  executeAt,
 			Member: string(data),
 		}).Err()
@@ -148,7 +162,9 @@ func (c *Client) Enqueue(ctx context.Context, taskName string, payload interface
 	return result, nil
 }
 
-// Schedule adds a task to run after a delay.
+// Schedule adds a task to run after a specified delay.
+// This is a convenience wrapper around Enqueue with the Delay option set.
+// The task will be stored in a ZSET until it becomes due, then moved to the stream.
 func (c *Client) Schedule(ctx context.Context, taskName string, payload interface{}, delay time.Duration, opts ...EnqueueOptions) (string, error) {
 	var opt EnqueueOptions
 	if len(opts) > 0 {
@@ -159,6 +175,8 @@ func (c *Client) Schedule(ctx context.Context, taskName string, payload interfac
 }
 
 // Broadcast sends a task to all workers.
+// The message is added to the broadcast stream, where every active worker
+// (listening via BroadcastListener) will receive a copy.
 func (c *Client) Broadcast(ctx context.Context, taskName string, payload interface{}) (string, error) {
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
@@ -166,7 +184,7 @@ func (c *Client) Broadcast(ctx context.Context, taskName string, payload interfa
 	}
 
 	result, err := c.redis.XAdd(ctx, &redis.XAddArgs{
-		Stream: fmt.Sprintf("%s:broadcast", StreamPrefix),
+		Stream: fmt.Sprintf("%s:broadcast", c.config.Prefix),
 		Values: map[string]interface{}{
 			"taskName":   taskName,
 			"payload":    string(payloadBytes),

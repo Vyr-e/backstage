@@ -1,3 +1,5 @@
+// Package backstage broadcast implementation.
+// Implements a fan-out messaging pattern where tasks are delivered to all active workers.
 package backstage
 
 import (
@@ -8,6 +10,7 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// BroadcastStream is the Redis stream key used for broadcast messages.
 const BroadcastStream = "backstage:broadcast"
 
 // BroadcastConfig for the broadcast listener.
@@ -36,6 +39,9 @@ type BroadcastMessage struct {
 type BroadcastHandler func(ctx context.Context, msg BroadcastMessage) error
 
 // BroadcastListener listens for broadcast messages on all workers.
+// Unlike standard queues where one worker processes a message, broadcast messages
+// are delivered to ALL active workers (fan-out). This is achieved by creating
+// a unique consumer group for each worker instance.
 type BroadcastListener struct {
 	redis         *redis.Client
 	consumerGroup string
@@ -60,6 +66,8 @@ func NewBroadcastListener(rdb *redis.Client, workerID string, handler BroadcastH
 }
 
 // Start begins listening for broadcast messages.
+// It runs a blocking loop that consumes messages from the worker's unique group.
+// The method returns when the context is canceled or Stop() is called.
 func (b *BroadcastListener) Start(ctx context.Context) error {
 	// Create unique consumer group for this worker
 	err := b.redis.XGroupCreateMkStream(ctx, BroadcastStream, b.consumerGroup, "0").Err()
@@ -131,7 +139,9 @@ func (b *BroadcastListener) handleMessage(ctx context.Context, msg redis.XMessag
 	b.redis.XAck(ctx, BroadcastStream, b.consumerGroup, msg.ID)
 }
 
-// Cleanup removes ghost consumer groups (all consumers idle beyond threshold).
+// Cleanup removes ghost consumer groups (consumers that have been idle beyond the threshold).
+// This prevents the accumulation of stale consumer groups from workers that have terminated.
+// It is typically called periodically by a maintenance task.
 func (b *BroadcastListener) Cleanup(ctx context.Context) (int, error) {
 	deleted := 0
 

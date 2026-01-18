@@ -1,3 +1,5 @@
+// Package backstage error definitions.
+// Defines custom error types for task processing, such as PreventTaskExecution.
 package backstage
 
 import "errors"

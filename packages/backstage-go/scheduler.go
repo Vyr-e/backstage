@@ -1,3 +1,5 @@
+// Package backstage scheduler implementation.
+// Manages cron-like schedules and moves delayed/scheduled tasks to active queues.
 package backstage
 
 import (
@@ -12,6 +14,10 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// Scheduler manages cron-like recurrent tasks.
+// It checks properly configured schedules and enqueues tasks when they are due.
+// It also handles moving delayed/scheduled tasks from the ZSET to the active stream
+// when they become ready for processing.
 type Scheduler struct {
 	redis     *redis.Client
 	schedules []*CronTask
@@ -21,16 +27,19 @@ type Scheduler struct {
 	prefix    string
 }
 
+// SchedulerConfig configuration for the Scheduler.
 type SchedulerConfig struct {
-	Host           string
-	Port           int
-	Password       string
-	DB             int
-	Schedules      []*CronTask
-	Queues         []*Queue
-	LogLevel       slog.Level
-	Silent         bool
-	Prefix         string // Stream key prefix (default: "backstage")
+	Host            string
+	Port            int
+	Password        string
+	DB              int
+	// Schedules list of cron tasks to run.
+	Schedules       []*CronTask
+	// Queues definitions for custom queues (used for resolving stream keys).
+	Queues          []*Queue
+	LogLevel        slog.Level
+	Silent          bool
+	Prefix          string // Stream key prefix (default: "backstage")
 	DefaultPriority string // Default priority name (default: "default")
 }
 
@@ -72,14 +81,15 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 		DB:       cfg.DB,
 	})
 
-	queues := make(map[string]*Queue)
-	for _, q := range cfg.Queues {
-		queues[q.Name] = q
-	}
-
 	prefix := cfg.Prefix
 	if prefix == "" {
 		prefix = StreamPrefix
+	}
+
+	queues := make(map[string]*Queue)
+	for _, q := range cfg.Queues {
+		q.Prefix = prefix
+		queues[q.Name] = q
 	}
 
 	return &Scheduler{
@@ -91,6 +101,12 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 	}
 }
 
+// Start runs the scheduler loop.
+// It manages two main activities:
+// 1. Enqueueing recurrrent cron tasks when their schedule matches.
+// 2. Waiting for the next scheduled run.
+// Note: Moving scheduled tasks (ZSET -> Stream) is typically handled by
+// calling ProcessScheduledTasks periodically, or by a separate routine.
 func (s *Scheduler) Start(ctx context.Context) error {
 	if len(s.schedules) == 0 {
 		s.logger.Error("No schedules configured")
@@ -169,7 +185,9 @@ func (s *Scheduler) enqueueTask(ctx context.Context, task *CronTask) {
 }
 
 // ProcessScheduledTasks atomically moves due tasks from ZSET to streams.
-// Uses a Lua script to prevent race conditions with multiple schedulers.
+// It effectively "wakes up" tasks that were scheduled with a delay.
+// Uses a Lua script to identify tasks with score <= now, moves them to their
+// target stream, and removes them from the ZSET in one atomic operation.
 func (s *Scheduler) ProcessScheduledTasks(ctx context.Context, defaultPriority string) (int64, error) {
 	scheduledKey := s.prefix + ":scheduled"
 	now := time.Now().UnixMilli()
