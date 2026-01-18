@@ -1,21 +1,69 @@
 {
-  "name": "@backstage/core",
-  "version": "0.1.0",
-  "module": "src/index.ts",
+  "name": "@vyre/backstage",
+  "version": "1.0.0",
+  "module": "dist/index.js",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "type": "module",
-  "private": true,
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.js"
+    },
+    "./core": {
+      "types": "./dist/core.d.ts",
+      "import": "./dist/core.js",
+      "require": "./dist/core.js"
+    },
+    "./worker": {
+      "types": "./dist/worker.d.ts",
+      "import": "./dist/worker.js",
+      "require": "./dist/worker.js"
+    },
+    "./queue": {
+      "types": "./dist/queue.d.ts",
+      "import": "./dist/queue.js",
+      "require": "./dist/queue.js"
+    },
+    "./scheduler": {
+      "types": "./dist/scheduler.d.ts",
+      "import": "./dist/scheduler.js",
+      "require": "./dist/scheduler.js"
+    },
+    "./reclaimer": {
+      "types": "./dist/reclaimer.d.ts",
+      "import": "./dist/reclaimer.js",
+      "require": "./dist/reclaimer.js"
+    },
+    "./types": {
+      "types": "./dist/types.d.ts",
+      "import": "./dist/types.js",
+      "require": "./dist/types.js"
+    }
+  },
   "scripts": {
     "dev": "bun run src/cli.ts",
-    "build": "bun build ./src/index.ts --outdir ./dist --target bun",
+    "build": "bun build ./src/index.ts ./src/core.ts ./src/worker.ts ./src/queue.ts ./src/scheduler.ts ./src/reclaimer.ts ./src/types.ts --outdir ./dist --target bun --sourcemap=external && tsc --emitDeclarationOnly --outDir ./dist",
     "test": "bun test",
     "run-workers": "bun run src/cli.ts run-workers",
-    "run-scheduler": "bun run src/cli.ts run-scheduler"
+    "run-scheduler": "bun run src/cli.ts run-scheduler",
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
   },
   "peerDependencies": {
-    "typescript": "^5"
+    "typescript": "^5",
+    "bun": ">=1.0.0"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
   },
   "dependencies": {
     "winston": "^3.19.0"

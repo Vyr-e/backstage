@@ -37,7 +37,7 @@ describe('Deduplication', () => {
       { foo: 'bar' },
       {
         dedupe: { key: 'unique-key-1' },
-      }
+      },
     );
     expect(id).toBeTruthy();
     expect(id).not.toBeNull();
@@ -50,7 +50,7 @@ describe('Deduplication', () => {
       { foo: 'bar' },
       {
         dedupe: { key: 'unique-key-2' },
-      }
+      },
     );
     expect(id1).toBeTruthy();
 
@@ -60,7 +60,7 @@ describe('Deduplication', () => {
       { foo: 'baz' },
       {
         dedupe: { key: 'unique-key-2' },
-      }
+      },
     );
     expect(id2).toBeNull();
   });
@@ -71,14 +71,14 @@ describe('Deduplication', () => {
       {},
       {
         dedupe: { key: 'key-a' },
-      }
+      },
     );
     const id2 = await stream.enqueue(
       'dedupe.test',
       {},
       {
         dedupe: { key: 'key-b' },
-      }
+      },
     );
     expect(id1).toBeTruthy();
     expect(id2).toBeTruthy();
@@ -91,7 +91,7 @@ describe('Deduplication', () => {
       {},
       {
         dedupe: { key: 'ttl-test', ttl: 1000 }, // 1 second TTL
-      }
+      },
     );
     expect(id1).toBeTruthy();
 
@@ -101,7 +101,7 @@ describe('Deduplication', () => {
       {},
       {
         dedupe: { key: 'ttl-test', ttl: 1000 },
-      }
+      },
     );
     expect(id2).toBeNull();
 
@@ -114,7 +114,7 @@ describe('Deduplication', () => {
       {},
       {
         dedupe: { key: 'ttl-test', ttl: 1000 },
-      }
+      },
     );
     expect(id3).toBeTruthy();
   });
@@ -127,7 +127,7 @@ describe('Custom Queues', () => {
       { userId: 123 },
       {
         queue: 'notifications',
-      }
+      },
     );
     expect(id).toBeTruthy();
 
@@ -166,11 +166,12 @@ describe('Enhanced Job Options', () => {
       { data: 1 },
       {
         attempts: 3,
-      }
+      },
     );
     expect(id).toBeTruthy();
 
     // Read the message back to verify metadata
+    if (!id) throw new Error('ID should not be null');
     const messages = await redis.send('XRANGE', ['backstage:default', id, id]);
     expect(messages).toBeTruthy();
     expect(Array.isArray(messages)).toBe(true);
@@ -178,7 +179,11 @@ describe('Enhanced Job Options', () => {
       const [, fields] = messages[0] as [string, string[]];
       const fieldMap = new Map<string, string>();
       for (let i = 0; i < fields.length; i += 2) {
-        fieldMap.set(fields[i], fields[i + 1]);
+        const key = fields[i];
+        const value = fields[i + 1];
+        if (key && value) {
+          fieldMap.set(key, value);
+        }
       }
       expect(fieldMap.get('attempts')).toBe('3');
     }
@@ -190,16 +195,21 @@ describe('Enhanced Job Options', () => {
       { data: 1 },
       {
         backoff: { type: 'exponential', delay: 1000, maxDelay: 60000 },
-      }
+      },
     );
     expect(id).toBeTruthy();
 
+    if (!id) throw new Error('ID should not be null');
     const messages = await redis.send('XRANGE', ['backstage:default', id, id]);
     if (messages && Array.isArray(messages) && messages.length > 0) {
       const [, fields] = messages[0] as [string, string[]];
       const fieldMap = new Map<string, string>();
       for (let i = 0; i < fields.length; i += 2) {
-        fieldMap.set(fields[i], fields[i + 1]);
+        const key = fields[i];
+        const value = fields[i + 1];
+        if (key && value) {
+          fieldMap.set(key, value);
+        }
       }
       const backoff = JSON.parse(fieldMap.get('backoff') || '{}');
       expect(backoff.type).toBe('exponential');
@@ -214,16 +224,21 @@ describe('Enhanced Job Options', () => {
       { data: 1 },
       {
         timeout: 30000,
-      }
+      },
     );
     expect(id).toBeTruthy();
 
+    if (!id) throw new Error('ID should not be null');
     const messages = await redis.send('XRANGE', ['backstage:default', id, id]);
     if (messages && Array.isArray(messages) && messages.length > 0) {
       const [, fields] = messages[0] as [string, string[]];
       const fieldMap = new Map<string, string>();
       for (let i = 0; i < fields.length; i += 2) {
-        fieldMap.set(fields[i], fields[i + 1]);
+        const key = fields[i];
+        const value = fields[i + 1];
+        if (key && value) {
+          fieldMap.set(key, value);
+        }
       }
       expect(fieldMap.get('timeout')).toBe('30000');
     }

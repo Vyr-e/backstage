@@ -107,10 +107,11 @@ describe('Cross-Language Interoperability', () => {
     const id = await stream.enqueue(
       'interop.scheduled',
       { test: true },
-      { delay: 60000 }
+      { delay: 60000 },
     );
 
-    expect(id.startsWith('scheduled:')).toBe(true);
+    expect(id).toBeTruthy();
+    expect(id!.startsWith('scheduled:')).toBe(true);
 
     // Verify it's in the sorted set in a format Go can read
     const scheduled = await redis.send('ZRANGE', [

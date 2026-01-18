@@ -28,7 +28,7 @@ describe('Stream Load Tests', () => {
 
     for (let i = 0; i < 10000; i++) {
       const id = await stream.enqueue(`load.test.${i}`, { index: i });
-      ids.push(id);
+      if (id) ids.push(id);
     }
 
     const elapsed = performance.now() - start;
@@ -45,7 +45,7 @@ describe('Stream Load Tests', () => {
     const start = performance.now();
 
     const promises = Array.from({ length: 10000 }, (_, i) =>
-      stream.enqueue(`concurrent.test.${i}`, { index: i })
+      stream.enqueue(`concurrent.test.${i}`, { index: i }),
     );
 
     const ids = await Promise.all(promises);
@@ -82,13 +82,13 @@ describe('Stream Load Tests', () => {
 
   test('distributes across priorities correctly', async () => {
     const urgentPromises = Array.from({ length: 1000 }, (_, i) =>
-      stream.enqueue(`urgent.${i}`, {}, { priority: Priority.URGENT })
+      stream.enqueue(`urgent.${i}`, {}, { priority: Priority.URGENT }),
     );
     const defaultPromises = Array.from({ length: 1000 }, (_, i) =>
-      stream.enqueue(`default.${i}`, {}, { priority: Priority.DEFAULT })
+      stream.enqueue(`default.${i}`, {}, { priority: Priority.DEFAULT }),
     );
     const lowPromises = Array.from({ length: 1000 }, (_, i) =>
-      stream.enqueue(`low.${i}`, {}, { priority: Priority.LOW })
+      stream.enqueue(`low.${i}`, {}, { priority: Priority.LOW }),
     );
 
     await Promise.all([...urgentPromises, ...defaultPromises, ...lowPromises]);
@@ -107,7 +107,7 @@ describe('Stream Load Tests', () => {
     const start = performance.now();
 
     const promises = Array.from({ length: 1000 }, (_, i) =>
-      stream.enqueue(`scheduled.${i}`, { index: i }, { delay: 60000 })
+      stream.enqueue(`scheduled.${i}`, { index: i }, { delay: 60000 }),
     );
 
     const ids = await Promise.all(promises);
@@ -115,7 +115,7 @@ describe('Stream Load Tests', () => {
 
     console.log(`Scheduled: 1,000 tasks in ${elapsed.toFixed(0)}ms`);
 
-    expect(ids.every((id) => id.startsWith('scheduled:'))).toBe(true);
+    expect(ids.every((id) => id && id.startsWith('scheduled:'))).toBe(true);
 
     // Verify in sorted set
     const scheduledCount = await redis.send('ZCARD', ['backstage:scheduled']);
@@ -127,7 +127,7 @@ describe('Stream Load Tests', () => {
     const id = await stream.enqueue(
       'due.now',
       { test: true },
-      { delay: -1000 }
+      { delay: -1000 },
     );
 
     // Process scheduled tasks

@@ -8,10 +8,10 @@ Backstage provides robust SDKs for building distributed background job processin
 
 ## Packages
 
-| Package                                 | Description            |
-| --------------------------------------- | ---------------------- |
-| [backstage-ts](./packages/backstage-ts) | TypeScript/Node.js SDK |
-| [backstage-go](./packages/backstage-go) | Go SDK                 |
+| Package                                 | Description        |
+| --------------------------------------- | ------------------ |
+| [backstage-ts](./packages/backstage-ts) | TypeScript/Bun SDK |
+| [backstage-go](./packages/backstage-go) | Go SDK             |
 
 ## Key Features
 
@@ -29,7 +29,7 @@ Backstage provides robust SDKs for building distributed background job processin
 ### TypeScript
 
 ```bash
-npm install @backstage/core
+bun add @backstage/core
 ```
 
 ```typescript
@@ -69,8 +69,8 @@ client.Start(context.Background())
 
 ### Prerequisites
 
-- Redis 7.0+
-- Node.js 18+ (for TypeScript SDK)
+- Redis 7.0+ (AOF persistence enabled)
+- Bun 1.3+ (for TypeScript SDK)
 - Go 1.21+ (for Go SDK)
 
 ### Running Redis
@@ -79,6 +79,10 @@ client.Start(context.Background())
 docker-compose up -d
 ```
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for details on how to contribute to this project.
+
 ## License
 
-MIT
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

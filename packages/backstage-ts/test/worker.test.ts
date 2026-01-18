@@ -53,7 +53,7 @@ describe('Worker Tests', () => {
       'payment.process',
       async (data) => {
         receivedPayload = data;
-      }
+      },
     );
 
     // Enqueue a task
@@ -91,13 +91,13 @@ describe('Worker Tests', () => {
     const urgentId = await worker.enqueue(
       'urgent.task',
       {},
-      { priority: Priority.URGENT }
+      { priority: Priority.URGENT },
     );
     const defaultId = await worker.enqueue('default.task', {});
     const lowId = await worker.enqueue(
       'low.task',
       {},
-      { priority: Priority.LOW }
+      { priority: Priority.LOW },
     );
 
     expect(urgentId).toBeTruthy();
@@ -109,7 +109,8 @@ describe('Worker Tests', () => {
     const worker = new Worker();
 
     const id = await worker.schedule('delayed.task', { delay: true }, 10000);
-    expect(id.startsWith('scheduled:')).toBe(true);
+    expect(id).toBeTruthy();
+    expect(id!.startsWith('scheduled:')).toBe(true);
   });
 
   test('handles handler with long execution time', async () => {
@@ -136,7 +137,7 @@ describe('Worker Load Tests', () => {
     const start = performance.now();
 
     const promises = Array.from({ length: 10000 }, (_, i) =>
-      worker.enqueue(`load.${i}`, { index: i })
+      worker.enqueue(`load.${i}`, { index: i }),
     );
 
     await Promise.all(promises);
@@ -145,8 +146,8 @@ describe('Worker Load Tests', () => {
 
     console.log(
       `Worker enqueue: 10,000 in ${elapsed.toFixed(0)}ms (${throughput.toFixed(
-        0
-      )} ops/sec)`
+        0,
+      )} ops/sec)`,
     );
     expect(throughput).toBeGreaterThan(500);
   });
