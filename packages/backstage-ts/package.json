@@ -1,5 +1,5 @@
 {
-  "name": "@vyre/backstage",
+  "name": "@vyr-e/backstage",
   "version": "1.0.0",
   "module": "dist/index.js",
   "main": "dist/index.js",
@@ -47,7 +47,7 @@
   },
   "scripts": {
     "dev": "bun run src/cli.ts",
-    "build": "bun build ./src/index.ts ./src/core.ts ./src/worker.ts ./src/queue.ts ./src/scheduler.ts ./src/reclaimer.ts ./src/types.ts --outdir ./dist --target bun --sourcemap=external && tsc --emitDeclarationOnly --outDir ./dist",
+    "build": "bun build ./src/index.ts ./src/core.ts ./src/worker.ts ./src/queue.ts ./src/scheduler.ts ./src/reclaimer.ts ./src/types.ts --outdir ./dist --target bun && tsc --emitDeclarationOnly --outDir ./dist",
     "test": "bun test",
     "run-workers": "bun run src/cli.ts run-workers",
     "run-scheduler": "bun run src/cli.ts run-scheduler",
