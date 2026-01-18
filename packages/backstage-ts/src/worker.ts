@@ -5,6 +5,7 @@
 import { Stream } from './stream';
 import { Reclaimer } from './reclaimer';
 import { Logger, createLogger, LogLevel, type LoggerConfig } from './logger';
+import { ScriptRegistry } from './script-registry';
 import {
   Priority,
   getDeadLetterKey,
@@ -20,6 +21,23 @@ import {
   DEFAULT_WORKER_CONFIG,
 } from './types';
 
+/**
+ * Main Worker class that processes tasks from Redis Streams.
+ *
+ * @example
+ * ```typescript
+ * const worker = new Worker({
+ *   host: 'localhost',
+ *   consumerGroup: 'my-app'
+ * });
+ *
+ * worker.on('send-email', async (job) => {
+ *   await sendEmail(job.to, job.body);
+ * });
+ *
+ * await worker.start();
+ * ```
+ */
 export class Worker {
   private config: Required<WorkerConfig>;
   private _redis: RedisClient;
@@ -27,22 +45,37 @@ export class Worker {
   private reclaimer: Reclaimer;
   private logger: Logger;
 
+  /**
+   * Registry for managing and running Lua scripts.
+   */
+  public scripts: ScriptRegistry;
+
   private tasks: Map<string, TaskConfig> = new Map();
   private running: boolean = false;
   private activeTasks: Set<Promise<void>> = new Set();
   private reclaimerInterval: Timer | null = null;
   private schedulerInterval: Timer | null = null;
 
-  /** Redis client used by this worker */
+  /**
+   * Redis client used by this worker.
+   */
   get redis(): RedisClient {
     return this._redis;
   }
 
-  /** Unique identifier for this worker */
+  /**
+   * Unique identifier for this worker instance.
+   */
   get workerId(): string {
     return this.config.workerId;
   }
 
+  /**
+   * Create a new Worker instance.
+   *
+   * @param config Worker configuration options
+   * @param loggerConfig Optional logger configuration
+   */
   constructor(config: WorkerConfig = {}, loggerConfig?: LoggerConfig) {
     const workerId = config.workerId || getDefaultWorkerId();
     this.config = {
@@ -60,8 +93,9 @@ export class Worker {
       this.config.consumerGroup,
       this.config.workerId,
       this.config.idleTimeout,
-      this.config.maxDeliveries
+      this.config.maxDeliveries,
     );
+    this.scripts = new ScriptRegistry(this._redis);
 
     this.logger = createLogger({
       level: LogLevel.INFO,
@@ -77,10 +111,25 @@ export class Worker {
     return `redis://${host}:${port}/${db}`;
   }
 
+  /**
+   * Register a handler for a task.
+   *
+   * @param taskName - Unique name of the task
+   * @param handler - Function to execute when task is received
+   * @param options - Task-specific configuration (priority, retries, etc.)
+   * @returns This worker instance for chaining
+   *
+   * @example
+   * ```typescript
+   * worker.on('resize-image', async (payload) => {
+   *   await resize(payload.src, payload.width);
+   * }, { priority: Priority.URGENT });
+   * ```
+   */
   on<T = unknown>(
     taskName: string,
     handler: TaskHandler<T>,
-    options: Partial<TaskConfig<T>> = {}
+    options: Partial<TaskConfig<T>> = {},
   ): this {
     if (this.tasks.has(taskName)) {
       throw new Error(`Task '${taskName}' is already registered`);
@@ -97,19 +146,50 @@ export class Worker {
     return this;
   }
 
+  /**
+   * Enqueue a task for immediate processing.
+   *
+   * @param taskName - Name of the task to enqueue
+   * @param payload - Data to pass to the task handler
+   * @param options - Enqueue options (priority, dedupe, etc.)
+   * @returns The Redis Stream message ID
+   *
+   * @example
+   * ```typescript
+   * await worker.enqueue('send-email', {
+   *   to: 'user@example.com',
+   *   subject: 'Welcome'
+   * });
+   * ```
+   */
   async enqueue(
     taskName: string,
     payload: unknown,
-    options: EnqueueOptions = {}
+    options: EnqueueOptions = {},
   ): Promise<string | null> {
     return this.stream.enqueue(taskName, payload, options);
   }
 
+  /**
+   * Schedule a task to run after a delay.
+   *
+   * @param taskName - Name of the task to schedule
+   * @param payload - Data to pass to the task handler
+   * @param delayMs - Delay in milliseconds
+   * @param options - Enqueue options (excluding delay)
+   * @returns The scheduled task ID
+   *
+   * @example
+   * ```typescript
+   * // Run execution in 1 hour
+   * await worker.schedule('cleanup-logs', {}, 3600 * 1000);
+   * ```
+   */
   async schedule(
     taskName: string,
     payload: unknown,
     delayMs: number,
-    options: Omit<EnqueueOptions, 'delay'> = {}
+    options: Omit<EnqueueOptions, 'delay'> = {},
   ): Promise<string | null> {
     return this.stream.enqueue(taskName, payload, {
       ...options,
@@ -117,6 +197,10 @@ export class Worker {
     });
   }
 
+  /**
+   * Start the worker.
+   * Connects to Redis, initializes streams, and begins the processing loop.
+   */
   async start(): Promise<void> {
     if (this.running) {
       throw new Error('Worker is already running');
@@ -134,17 +218,21 @@ export class Worker {
 
     this.reclaimerInterval = setInterval(
       () => this.runReclaimer(),
-      this.config.reclaimerInterval
+      this.config.reclaimerInterval,
     );
 
     this.schedulerInterval = setInterval(
       () => this.stream.processScheduledTasks(),
-      1000
+      1000,
     );
 
     await this.processLoop();
   }
 
+  /**
+   * Stop the worker gracefully.
+   * Stops accepting new tasks and waits for active tasks to complete within the grace period.
+   */
   async stop(): Promise<void> {
     if (!this.running) return;
 
@@ -164,14 +252,14 @@ export class Worker {
       this.logger.info(`Waiting for ${this.activeTasks.size} active tasks...`);
 
       const gracePeriodPromise = new Promise<void>((resolve) =>
-        setTimeout(resolve, this.config.gracePeriod)
+        setTimeout(resolve, this.config.gracePeriod),
       );
 
       await Promise.race([Promise.all(this.activeTasks), gracePeriodPromise]);
 
       if (this.activeTasks.size > 0) {
         this.logger.warn(
-          `Force exiting with ${this.activeTasks.size} unfinished tasks`
+          `Force exiting with ${this.activeTasks.size} unfinished tasks`,
         );
       }
     }
@@ -257,7 +345,7 @@ export class Worker {
 
   private async handleMessage(
     streamKey: string,
-    message: StreamMessage
+    message: StreamMessage,
   ): Promise<void> {
     const task = this.tasks.get(message.taskName);
 
@@ -275,7 +363,7 @@ export class Worker {
   private async executeTask(
     streamKey: string,
     message: StreamMessage,
-    task: TaskConfig
+    task: TaskConfig,
   ): Promise<void> {
     try {
       this.logger.debug(`Executing task: ${task.name}`);
@@ -289,7 +377,7 @@ export class Worker {
           await this.schedule(
             instruction.next,
             instruction.payload,
-            instruction.delay
+            instruction.delay,
           );
         } else {
           await this.enqueue(instruction.next, instruction.payload);
@@ -297,7 +385,7 @@ export class Worker {
 
         this.logger.debug(
           `Chained to: ${instruction.next}` +
-            (instruction.delay ? ` (delay: ${instruction.delay}ms)` : '')
+            (instruction.delay ? ` (delay: ${instruction.delay}ms)` : ''),
         );
       }
 
@@ -338,7 +426,7 @@ export class Worker {
 
   private async moveToDeadLetter(
     streamKey: string,
-    message: StreamMessage
+    message: StreamMessage,
   ): Promise<void> {
     let priority = Priority.DEFAULT;
     if (streamKey.includes(Priority.URGENT)) {
@@ -350,7 +438,7 @@ export class Worker {
     const deadLetterKey = getDeadLetterKey(priority);
 
     this.logger.warn(
-      `Moving to dead-letter: ${message.taskName} (${message.id})`
+      `Moving to dead-letter: ${message.taskName} (${message.id})`,
     );
 
     await this._redis.send('XADD', [

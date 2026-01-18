@@ -24,6 +24,17 @@ export interface BroadcastConfig {
   loggerConfig?: LoggerConfig;
 }
 
+/**
+ * Handles broadcasting messages to all active workers.
+ * Uses a dedicated broadcast stream with per-worker consumer groups.
+ *
+ * @example
+ * ```typescript
+ * const broadcast = new Broadcast({ worker });
+ * await broadcast.initialize();
+ * await broadcast.send('config-update', { version: 2 });
+ * ```
+ */
 export class Broadcast {
   private redis: RedisClient;
   private workerId: string;
@@ -31,6 +42,11 @@ export class Broadcast {
   private logger: Logger;
   private consumerIdleThreshold: number;
 
+  /**
+   * Create a new Broadcast instance.
+   *
+   * @param config - Configuration options
+   */
   constructor(config: BroadcastConfig) {
     // Extract redis and workerId from worker or use provided values
     if (config.worker) {
@@ -41,7 +57,7 @@ export class Broadcast {
       this.workerId = config.workerId;
     } else {
       throw new Error(
-        'Broadcast requires either a worker instance or both redis and workerId'
+        'Broadcast requires either a worker instance or both redis and workerId',
       );
     }
 
@@ -53,6 +69,12 @@ export class Broadcast {
     });
   }
 
+  /**
+   * Initialize the broadcast system.
+   * Creates a unique consumer group for this worker on the broadcast stream.
+   *
+   * @returns Promise that resolves when initialized
+   */
   async initialize(): Promise<void> {
     try {
       await this.redis.send('XGROUP', [
@@ -70,6 +92,13 @@ export class Broadcast {
     }
   }
 
+  /**
+   * Send a broadcast message to all listening workers.
+   *
+   * @param taskName - Name of the broadcast task
+   * @param payload - Data payload
+   * @returns The message ID
+   */
   async send(taskName: string, payload: unknown): Promise<string> {
     const messageId = await this.redis.send('XADD', [
       BROADCAST_STREAM,
@@ -85,6 +114,12 @@ export class Broadcast {
     return messageId as string;
   }
 
+  /**
+   * Read new broadcast messages for this worker.
+   *
+   * @param blockMs - Milliseconds to block if no messages available (default 0)
+   * @returns Array of stream messages
+   */
   async read(blockMs: number = 0): Promise<StreamMessage[]> {
     const messages: StreamMessage[] = [];
 
@@ -129,6 +164,12 @@ export class Broadcast {
     return messages;
   }
 
+  /**
+   * Acknowledge a broadcast message.
+   * This marks it as processed for this worker's consumer group.
+   *
+   * @param messageId - ID of the message to acknowledge
+   */
   async ack(messageId: string): Promise<void> {
     await this.redis.send('XACK', [
       BROADCAST_STREAM,
@@ -154,8 +195,10 @@ export class Broadcast {
   }
 
   /**
-   * Clean up ghost consumer groups.
-   * Checks consumer idle time, not just consumer count (which includes ghosts).
+   * Clean up ghost consumer groups from terminated workers.
+   * Checks consumer idle time to identify stale groups.
+   *
+   * @returns Number of deleted consumer groups
    */
   async cleanup(): Promise<number> {
     let deleted = 0;

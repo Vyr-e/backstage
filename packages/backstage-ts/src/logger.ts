@@ -25,15 +25,24 @@ export interface LogEntry {
 export type LogHandler = (entry: LogEntry) => void | Promise<void>;
 
 export interface LoggerConfig {
+  /** Minimum log level to output */
   level?: LogLevel;
+  /** File path to write logs to (JSON format) */
   file?: string;
+  /** Whether this is a child logger */
   isChild?: boolean;
+  /** Whether this is a scheduler logger (changes prefix) */
   isScheduler?: boolean;
+  /** Custom log handler function */
   handler?: LogHandler;
   /** Disable all logging */
   silent?: boolean;
 }
 
+/**
+ * Logger wrapper around Winston.
+ * Supports console output, file output, and custom handlers.
+ */
 export class Logger {
   private winston: winston.Logger;
   private handler?: LogHandler;
@@ -41,6 +50,11 @@ export class Logger {
   private isChild: boolean;
   private prefix: string;
 
+  /**
+   * Create a new Logger instance.
+   *
+   * @param config - Logger configuration
+   */
   constructor(config: LoggerConfig = {}) {
     this.handler = config.handler;
     this.silent = config.silent ?? false;
@@ -58,9 +72,9 @@ export class Logger {
               return `${timestamp} ${level.toUpperCase().padEnd(5)} [${
                 this.prefix
               }]: ${message}`;
-            })
+            }),
           ),
-        })
+        }),
       );
     }
 
@@ -70,9 +84,9 @@ export class Logger {
           filename: config.file,
           format: winston.format.combine(
             winston.format.timestamp(),
-            winston.format.json()
+            winston.format.json(),
           ),
-        })
+        }),
       );
     }
 
@@ -83,10 +97,17 @@ export class Logger {
     });
   }
 
+  /**
+   * Set a custom log handler.
+   * Useful for sending logs to external services.
+   */
   setHandler(handler: LogHandler): void {
     this.handler = handler;
   }
 
+  /**
+   * Silence the logger at runtime.
+   */
   setSilent(silent: boolean): void {
     this.silent = silent;
     this.winston.silent = silent && !this.handler;
@@ -102,6 +123,9 @@ export class Logger {
     }
   }
 
+  /**
+   * Log a debug message.
+   */
   debug(message: string, payload?: Record<string, unknown>): void {
     const entry: LogEntry = {
       level: LogLevel.DEBUG,
@@ -113,6 +137,9 @@ export class Logger {
     this.winston.debug(message, { payload });
   }
 
+  /**
+   * Log an info message.
+   */
   info(message: string, payload?: Record<string, unknown>): void {
     const entry: LogEntry = {
       level: LogLevel.INFO,
@@ -124,6 +151,9 @@ export class Logger {
     this.winston.info(message, { payload });
   }
 
+  /**
+   * Log a warning message.
+   */
   warn(message: string, payload?: Record<string, unknown>): void {
     const entry: LogEntry = {
       level: LogLevel.WARN,
@@ -135,6 +165,10 @@ export class Logger {
     this.winston.warn(message, { payload });
   }
 
+  /**
+   * Log an error message.
+   * Accepts a string or an Error object.
+   */
   error(message: string | Error, payload?: Record<string, unknown>): void {
     if (message instanceof Error) {
       const entry: LogEntry = {
@@ -172,6 +206,9 @@ export class Logger {
   }
 }
 
+/**
+ * Helper to create a logger instance.
+ */
 export function createLogger(config?: LoggerConfig): Logger {
   return new Logger(config);
 }

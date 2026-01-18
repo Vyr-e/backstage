@@ -5,6 +5,10 @@
 import { type StreamMessage, type RedisClient, parseFields } from './types';
 import { Logger, createLogger, LogLevel, type LoggerConfig } from './logger';
 
+/**
+ * Responsible for recovering idle messages from other consumers.
+ * Uses XPENDING and XCLAIM to re-assign tasks that have timed out.
+ */
 export class Reclaimer {
   private redis: RedisClient;
   private consumerGroup: string;
@@ -13,13 +17,23 @@ export class Reclaimer {
   private maxDeliveries: number;
   private logger: Logger;
 
+  /**
+   * Create a new Reclaimer instance.
+   *
+   * @param redis - Redis client
+   * @param consumerGroup - Consumer group name
+   * @param consumerId - ID of this consumer (the one claiming the tasks)
+   * @param idleTimeout - Milliseconds a task must be idle before it can be claimed
+   * @param maxDeliveries - Max delivery attempts (currently unused in reclaimer logic but available)
+   * @param loggerConfig - Logger configuration
+   */
   constructor(
     redis: RedisClient,
     consumerGroup: string,
     consumerId: string,
     idleTimeout: number,
     maxDeliveries: number,
-    loggerConfig?: LoggerConfig
+    loggerConfig?: LoggerConfig,
   ) {
     this.redis = redis;
     this.consumerGroup = consumerGroup;
@@ -33,12 +47,23 @@ export class Reclaimer {
     });
   }
 
+  /**
+   * Initialize the reclaimer logic.
+   *
+   * @param streamKeys - List of stream keys to monitor
+   */
   async initialize(streamKeys: string[]): Promise<void> {
     this.logger.debug(
-      `Initialized for ${streamKeys.length} streams, idle timeout: ${this.idleTimeout}ms`
+      `Initialized for ${streamKeys.length} streams, idle timeout: ${this.idleTimeout}ms`,
     );
   }
 
+  /**
+   * Check for and claim idle messages from a specific stream.
+   *
+   * @param streamKey - The stream to check
+   * @returns Array of claimed messages that are now owned by this consumer
+   */
   async reclaimIdleMessages(streamKey: string): Promise<StreamMessage[]> {
     const claimed: StreamMessage[] = [];
 
@@ -64,7 +89,7 @@ export class Reclaimer {
           string,
           string,
           number,
-          number
+          number,
         ];
 
         try {
@@ -85,11 +110,11 @@ export class Reclaimer {
                 const message = this.parseMessage(
                   claimedId,
                   fields,
-                  deliveryCount
+                  deliveryCount,
                 );
                 if (message) {
                   this.logger.debug(
-                    `Claimed ${messageId} (delivery #${deliveryCount})`
+                    `Claimed ${messageId} (delivery #${deliveryCount})`,
                   );
                   claimed.push(message);
                 }
@@ -110,7 +135,7 @@ export class Reclaimer {
   private parseMessage(
     id: string,
     fields: unknown[],
-    deliveryCount: number
+    deliveryCount: number,
   ): StreamMessage | null {
     try {
       const data = parseFields(fields);

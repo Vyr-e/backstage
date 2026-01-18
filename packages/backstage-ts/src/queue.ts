@@ -10,7 +10,7 @@ import { BackstageError } from './exceptions';
  * Queue configuration options.
  */
 export interface QueueOptions {
-  /** Queue priority (lower = higher priority) */
+  /** Queue priority (lower number = higher priority) */
   priority?: number;
   /** Soft timeout in milliseconds */
   softTimeout?: number;
@@ -22,15 +22,30 @@ export interface QueueOptions {
 
 /**
  * Queue class representing a task queue with priority and timeouts.
+ *
+ * @example
+ * ```typescript
+ * const queue = new Queue('emails', { priority: 1 });
+ * ```
  */
 export class Queue {
   public readonly name: string;
   public readonly prefix: string;
   public priority: number;
+  /** Soft timeout in milliseconds */
   public softTimeout?: number;
+  /** Hard timeout in milliseconds */
   public hardTimeout?: number;
+  /** Maximum retry attempts */
   public maxRetries?: number;
 
+  /**
+   * Create a new Queue definition.
+   *
+   * @param name - Unique name of the queue (alphanumeric, underscores, dashes)
+   * @param options - Configuration options like priority and timeouts
+   * @throws {BackstageError} If name is invalid or timeouts are inconsistent
+   */
   constructor(name: string, options: QueueOptions = {}) {
     // Sanitize name
     this.name = name.replace(/[^a-zA-Z0-9_.-]/g, '');
@@ -51,13 +66,16 @@ export class Queue {
       this.hardTimeout <= this.softTimeout
     ) {
       throw new BackstageError(
-        `Queue hard timeout (${this.hardTimeout}) must be greater than soft timeout (${this.softTimeout})`
+        `Queue hard timeout (${this.hardTimeout}) must be greater than soft timeout (${this.softTimeout})`,
       );
     }
   }
 
   /**
    * Set default priority if not explicitly set.
+   * Internal use primarily.
+   *
+   * @param lowestPriority - The lowest priority level currently in use
    */
   setDefaultPriority(lowestPriority: number): void {
     if (this.priority < 0) {
@@ -73,14 +91,14 @@ export class Queue {
   }
 
   /**
-   * Get the scheduled tasks sorted set key.
+   * Get the scheduled tasks sorted set key for this queue.
    */
   get scheduledKey(): string {
     return `${this.prefix}:scheduled:${this.name}`;
   }
 
   /**
-   * Get the dead-letter stream key.
+   * Get the dead-letter stream key for this queue.
    */
   get deadLetterKey(): string {
     return `${this.prefix}:${this.name}:dead-letter`;
@@ -88,10 +106,15 @@ export class Queue {
 
   /**
    * Create a Queue from various input types.
+   * Helper for parsing queue definitions from config.
+   *
+   * @param input - Queue instance, name string, or tuple [name, priority]
+   * @param existingQueues - Optional map of validation against existing queues
+   * @returns A Queue instance
    */
   static create(
     input: Queue | string | [string, number] | [number, string],
-    existingQueues?: Map<string, Queue>
+    existingQueues?: Map<string, Queue>,
   ): Queue {
     if (input instanceof Queue) {
       if (existingQueues && !existingQueues.has(input.name)) {

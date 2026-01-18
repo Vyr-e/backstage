@@ -19,6 +19,20 @@ export interface SchedulerConfig {
   logFile?: string;
 }
 
+/**
+ * Scheduler for generating periodic tasks based on cron expressions.
+ * Enqueues tasks to Redis Streams when their schedule is due.
+ *
+ * @example
+ * ```typescript
+ * const scheduler = new Scheduler({
+ *   schedules: [
+ *     CronTask.create('daily-report', '0 0 * * *', { emails: true })
+ *   ]
+ * });
+ * await scheduler.start();
+ * ```
+ */
 export class Scheduler {
   private config: SchedulerConfig;
   private redis: RedisClient;
@@ -27,6 +41,11 @@ export class Scheduler {
   private logger: Logger;
   private running = false;
 
+  /**
+   * Create a new Scheduler instance.
+   *
+   * @param config - Configuration options including schedules and connection details
+   */
   constructor(config: SchedulerConfig = {}) {
     this.config = config;
     this.schedules = config.schedules ?? [];
@@ -58,6 +77,10 @@ export class Scheduler {
     return `redis://${host}:${port}/${db}`;
   }
 
+  /**
+   * Start the scheduler.
+   * Begins checking for due tasks and enqueueing them.
+   */
   async start(): Promise<void> {
     if (this.schedules.length === 0) {
       this.logger.error('No scheduled tasks configured');
@@ -97,7 +120,7 @@ export class Scheduler {
       // Sleep until next task
       const sleepMs = Math.max(minDelay, 1000);
       this.logger.debug(
-        `Sleeping ${Math.round(sleepMs / 1000)}s until next task`
+        `Sleeping ${Math.round(sleepMs / 1000)}s until next task`,
       );
       await Bun.sleep(sleepMs);
     }
@@ -105,6 +128,10 @@ export class Scheduler {
     this.logger.info('Scheduler stopped');
   }
 
+  /**
+   * Stop the scheduler.
+   * Gracefully shuts down the scheduling loop.
+   */
   stop(): void {
     this.running = false;
   }

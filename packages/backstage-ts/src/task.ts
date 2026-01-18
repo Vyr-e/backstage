@@ -12,7 +12,7 @@ import type { WorkflowInstruction } from './types';
  * Task handler function type.
  */
 export type TaskFn<TData = unknown, TResult = void | WorkflowInstruction> = (
-  data: TData
+  data: TData,
 ) => Promise<TResult>;
 
 /**
@@ -38,19 +38,30 @@ export interface BackstageInstance {
   enqueue(
     taskName: string,
     payload: unknown,
-    queueName?: string
+    queueName?: string,
   ): Promise<string | null>;
   schedule(
     taskName: string,
     payload: unknown,
     delayMs: number,
-    queueName?: string
+    queueName?: string,
   ): Promise<string | null>;
   broadcast(taskName: string, payload: unknown): Promise<string>;
 }
 
 /**
- * Task class representing a registered task with its handler.
+ * Task wrapper that provides strict typing and convenience methods.
+ * Allows defining tasks separately from the worker instance.
+ *
+ * @example
+ * ```typescript
+ * export const sendEmail = new Task(async (data: { to: string }) => {
+ *   await emailClient.send(data.to);
+ * }, { name: 'send-email' });
+ *
+ * // Later
+ * await sendEmail.enqueue({ to: 'bob@example.com' });
+ * ```
  */
 export class Task<TData = unknown, TResult = void | WorkflowInstruction> {
   public readonly name: string;
@@ -62,12 +73,18 @@ export class Task<TData = unknown, TResult = void | WorkflowInstruction> {
 
   private backstage?: BackstageInstance;
 
+  /**
+   * Create a new defined task.
+   *
+   * @param fn - The async function that performs the work
+   * @param options - Task options (name, queue, etc.)
+   */
   constructor(fn: TaskFn<TData, TResult>, options: TaskOptions = {}) {
     // Name is required
     const name = options.name || fn.name;
     if (!name) {
       throw new Error(
-        'Task name is required. Either provide it in options or use a named function.'
+        'Task name is required. Either provide it in options or use a named function.',
       );
     }
 
@@ -85,7 +102,7 @@ export class Task<TData = unknown, TResult = void | WorkflowInstruction> {
       this.hardTimeout <= this.softTimeout
     ) {
       throw new Error(
-        `Task hard timeout (${this.hardTimeout}) must be greater than soft timeout (${this.softTimeout})`
+        `Task hard timeout (${this.hardTimeout}) must be greater than soft timeout (${this.softTimeout})`,
       );
     }
   }
@@ -93,6 +110,8 @@ export class Task<TData = unknown, TResult = void | WorkflowInstruction> {
   /**
    * Bind this task to a Backstage instance.
    * Called internally when registering the task.
+   *
+   * @param backstage - The Backstage (Worker) instance
    */
   bind(backstage: BackstageInstance): void {
     this.backstage = backstage;
@@ -100,6 +119,8 @@ export class Task<TData = unknown, TResult = void | WorkflowInstruction> {
 
   /**
    * Enqueue this task for immediate execution.
+   *
+   * @param data - The type-safe payload for this task
    * @returns Message ID, or null if deduplicated
    */
   async enqueue(data?: TData): Promise<string | null> {
@@ -113,11 +134,14 @@ export class Task<TData = unknown, TResult = void | WorkflowInstruction> {
 
   /**
    * Schedule this task for delayed execution.
+   *
+   * @param delayMs - Delay in milliseconds before execution
+   * @param data - The type-safe payload
    * @returns Message ID, or null if deduplicated
    */
   async enqueueAfterDelay(
     delayMs: number,
-    data?: TData
+    data?: TData,
   ): Promise<string | null> {
     if (!this.backstage) {
       throw new Error('Task not bound to a Backstage instance');
@@ -128,8 +152,11 @@ export class Task<TData = unknown, TResult = void | WorkflowInstruction> {
   }
 
   /**
-   * Schedule this task for a specific time.
-   * @returns Message ID, or null if deduplicated
+   * Schedule this task for a specific date/time.
+   *
+   * @param date - The Date object for when to execute
+   * @param data - The type-safe payload
+   * @returns Message ID
    */
   async enqueueAt(date: Date, data?: TData): Promise<string | null> {
     const delayMs = date.getTime() - Date.now();
@@ -141,6 +168,10 @@ export class Task<TData = unknown, TResult = void | WorkflowInstruction> {
 
   /**
    * Broadcast this task to all workers.
+   * Useful for cache invalidation or configuration updates.
+   *
+   * @param data - The payload
+   * @returns Message ID
    */
   async broadcast(data?: TData): Promise<string> {
     if (!this.backstage) {

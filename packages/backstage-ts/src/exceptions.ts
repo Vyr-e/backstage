@@ -6,6 +6,7 @@
 
 /**
  * Base Backstage error class.
+ * All SDK errors inherit from this.
  */
 export class BackstageError extends Error {
   constructor(message: string) {
@@ -33,7 +34,7 @@ export class SoftTimeout extends BackstageError {
  * Hard timeout exception.
  *
  * Thrown when a task exceeds its hard timeout.
- * The task is terminated and moved to dead-letter.
+ * The task is terminated and moved to dead-letter immediately, ignoring retries.
  */
 export class HardTimeout extends BackstageError {
   constructor(message = 'hard timeout') {
@@ -46,8 +47,8 @@ export class HardTimeout extends BackstageError {
 /**
  * Prevent task execution exception.
  *
- * Thrown from beforeTaskStarted callback to skip a task
- * without treating it as an error.
+ * Thrown from a `beforeTaskStarted` hook (if implemented) to skip
+ * a task without treating it as an error.
  */
 export class PreventTaskExecution extends BackstageError {
   constructor(message = 'task execution prevented') {
@@ -59,6 +60,7 @@ export class PreventTaskExecution extends BackstageError {
 
 /**
  * Task not found exception.
+ * Thrown when attempting to execute a task that hasn't been registered.
  */
 export class TaskNotFound extends BackstageError {
   public taskName: string;
@@ -73,6 +75,7 @@ export class TaskNotFound extends BackstageError {
 
 /**
  * Queue not found exception.
+ * Thrown when referencing a non-existent queue.
  */
 export class QueueNotFound extends BackstageError {
   public queueName: string;
@@ -87,6 +90,7 @@ export class QueueNotFound extends BackstageError {
 
 /**
  * Invalid cron schedule exception.
+ * Thrown when a cron expression cannot be parsed.
  */
 export class InvalidCronSchedule extends BackstageError {
   public schedule: string;
@@ -101,6 +105,7 @@ export class InvalidCronSchedule extends BackstageError {
 
 /**
  * Redis connection error.
+ * Thrown when Redis operations fail due to connection issues.
  */
 export class RedisConnectionError extends BackstageError {
   constructor(message: string) {

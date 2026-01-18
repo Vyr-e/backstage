@@ -65,6 +65,10 @@ export interface StreamConfig {
   queues?: Queue[];
 }
 
+/**
+ * Manages Redis Stream interactions for task enqueueing and processing.
+ * Handles priority queues, scheduled tasks, and consumer groups.
+ */
 export class Stream {
   private redis: RedisClient;
   private consumerGroup: string;
@@ -72,10 +76,17 @@ export class Stream {
   private defaultPriority: Priority;
   private customQueues: Queue[];
 
+  /**
+   * Create a new Stream instance.
+   *
+   * @param redis - Redis client instance
+   * @param consumerGroup - Name of the consumer group for this worker
+   * @param config - Stream configuration options
+   */
   constructor(
     redis: RedisClient,
     consumerGroup: string,
-    config: StreamConfig = {}
+    config: StreamConfig = {},
   ) {
     this.redis = redis;
     this.consumerGroup = consumerGroup;
@@ -84,6 +95,12 @@ export class Stream {
     this.customQueues = config.queues ?? [];
   }
 
+  /**
+   * Initialize consumer groups for all priority levels and custom queues.
+   * Creates the streams if they don't exist.
+   *
+   * @returns Promise that resolves when initialization is complete
+   */
   async initialize(): Promise<void> {
     // Initialize default priority queues
     const priorities = [Priority.URGENT, Priority.DEFAULT, Priority.LOW];
@@ -117,12 +134,22 @@ export class Stream {
 
   /**
    * Enqueue a task for processing.
-   * @returns Message ID, or null if deduplicated
+   * Supports immediate execution, delayed scheduling, and deduplication.
+   *
+   * @param taskName - Name of the task to execute
+   * @param payload - Data payload for the task
+   * @param options - Queue options (priority, delay, dedupe, etc.)
+   * @returns The Redis Stream message ID, or null if deduplicated
+   *
+   * @example
+   * ```typescript
+   * await stream.enqueue('send-email', { userId: '123' }, { priority: Priority.URGENT });
+   * ```
    */
   async enqueue(
     taskName: string,
     payload: unknown,
-    options: EnqueueOptions = {}
+    options: EnqueueOptions = {},
   ): Promise<string | null> {
     // Handle deduplication
     if (options.dedupe) {
@@ -204,7 +231,10 @@ export class Stream {
 
   /**
    * Process scheduled tasks atomically using Lua script.
-   * Safe for multiple scheduler instances.
+   * Moves tasks from the scheduled ZSET to their respective streams when due.
+   * Safe for multiple scheduler instances to run concurrently.
+   *
+   * @returns Number of tasks processed and moved to streams
    */
   async processScheduledTasks(): Promise<number> {
     const scheduledKey = `${this.prefix}:scheduled`;
@@ -224,7 +254,9 @@ export class Stream {
 
   /**
    * Get all stream keys in priority order.
-   * Default queues first, then custom queues sorted by priority.
+   * Default queues come first (URGENT -> DEFAULT -> LOW), followed by custom queues sorted by priority.
+   *
+   * @returns Array of Redis stream keys
    */
   getStreamKeys(): string[] {
     const defaultKeys = [
@@ -235,7 +267,7 @@ export class Stream {
 
     // Sort custom queues by priority (lower = higher priority)
     const sortedCustom = [...this.customQueues].sort(
-      (a, b) => a.priority - b.priority
+      (a, b) => a.priority - b.priority,
     );
     const customKeys = sortedCustom.map((q) => q.streamKey);
 
@@ -248,6 +280,9 @@ export class Stream {
 
   /**
    * Add a custom queue at runtime.
+   * Creates the consumer group for the new queue.
+   *
+   * @param queue - The Queue instance to add
    */
   async addQueue(queue: Queue): Promise<void> {
     await this.createConsumerGroup(queue.streamKey);
