@@ -74,6 +74,10 @@ type Client struct {
 	ackChan       chan ackRequest
 	ackWg         sync.WaitGroup
 	ackMu         sync.Mutex
+
+	// Custom queues
+	customQueues  []string
+	queuesMu      sync.RWMutex
 }
 
 type ackRequest struct {
@@ -103,6 +107,19 @@ func New(cfg Config) *Client {
 		pendingAcks: make(map[string][]string),
 		ackChan:     make(chan ackRequest, 1000), // Buffer for high throughput
 	}
+}
+
+// RegisterQueue adds a custom queue for the consumer to monitor.
+func (c *Client) RegisterQueue(name string) {
+	c.queuesMu.Lock()
+	defer c.queuesMu.Unlock()
+	
+	for _, q := range c.customQueues {
+		if q == name {
+			return
+		}
+	}
+	c.customQueues = append(c.customQueues, name)
 }
 
 // Close closes the Redis connection.

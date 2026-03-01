@@ -130,13 +130,25 @@ func (c *Client) Stop() {
 }
 
 func (c *Client) initConsumerGroups(ctx context.Context) error {
+	var streams []string
+	
+	// Default priority queues
 	priorities := []Priority{PriorityUrgent, PriorityDefault, PriorityLow}
-
 	for _, p := range priorities {
-		key := c.streamKey(p)
+		streams = append(streams, c.streamKey(p))
+	}
+
+	// Custom registered queues
+	c.queuesMu.RLock()
+	for _, q := range c.customQueues {
+		streams = append(streams, fmt.Sprintf("%s:%s", c.config.Prefix, q))
+	}
+	c.queuesMu.RUnlock()
+
+	for _, key := range streams {
 		err := c.redis.XGroupCreateMkStream(ctx, key, c.config.ConsumerGroup, "0").Err()
 		if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
-			return err
+			return fmt.Errorf("XGroupCreate for %s: %w", key, err)
 		}
 	}
 
@@ -145,11 +157,24 @@ func (c *Client) initConsumerGroups(ctx context.Context) error {
 
 
 func (c *Client) processLoop(ctx context.Context, cfg ConsumerConfig) error {
-	streams := []string{
-		c.streamKey(PriorityUrgent),
-		c.streamKey(PriorityDefault),
-		c.streamKey(PriorityLow),
-		">", ">", ">",
+	var streams []string
+	
+	// Default priority queues
+	priorities := []Priority{PriorityUrgent, PriorityDefault, PriorityLow}
+	for _, p := range priorities {
+		streams = append(streams, c.streamKey(p))
+	}
+
+	// Custom registered queues
+	c.queuesMu.RLock()
+	for _, q := range c.customQueues {
+		streams = append(streams, fmt.Sprintf("%s:%s", c.config.Prefix, q))
+	}
+	c.queuesMu.RUnlock()
+
+	// Append ">" for each stream to read new messages
+	for range streams {
+		streams = append(streams, ">")
 	}
 
 	// Semaphore for concurrency control (backpressure)
@@ -280,11 +305,22 @@ func (c *Client) runReclaimer(ctx context.Context, cfg ConsumerConfig) {
 }
 
 func (c *Client) reclaimIdleMessages(ctx context.Context, cfg ConsumerConfig) {
+	var streams []string
+	
+	// Default priority queues
 	priorities := []Priority{PriorityUrgent, PriorityDefault, PriorityLow}
-
 	for _, p := range priorities {
-		key := c.streamKey(p)
+		streams = append(streams, c.streamKey(p))
+	}
 
+	// Custom registered queues
+	c.queuesMu.RLock()
+	for _, q := range c.customQueues {
+		streams = append(streams, fmt.Sprintf("%s:%s", c.config.Prefix, q))
+	}
+	c.queuesMu.RUnlock()
+
+	for _, key := range streams {
 		pending, err := c.redis.XPendingExt(ctx, &redis.XPendingExtArgs{
 			Stream: key,
 			Group:  c.config.ConsumerGroup,
@@ -331,7 +367,14 @@ func (c *Client) reclaimIdleMessages(ctx context.Context, cfg ConsumerConfig) {
 			}
 
 			if msg.RetryCount > int64(cfg.MaxDeliveries) {
-				c.moveToDeadLetter(ctx, p, claimed[0])
+				// Determine priority for DLQ
+				priority := PriorityDefault
+				if key == c.streamKey(PriorityUrgent) {
+					priority = PriorityUrgent
+				} else if key == c.streamKey(PriorityLow) {
+					priority = PriorityLow
+				}
+				c.moveToDeadLetter(ctx, priority, claimed[0])
 			} else {
 				c.handleMessage(ctx, key, claimed[0])
 			}
