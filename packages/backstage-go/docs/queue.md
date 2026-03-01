@@ -5,7 +5,7 @@ Queue abstraction for managing stream keys and priorities.
 ## Basic Usage
 
 ```go
-import backstage "github.com/backstage/go"
+import backstage "github.com/vyr-e/Backstage/go"
 
 // Create queue
 queue := backstage.NewQueue("notifications")

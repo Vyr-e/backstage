@@ -7,7 +7,7 @@ Enqueue tasks to Redis Streams.
 ```go
 import (
     "context"
-    backstage "github.com/backstage/go"
+    backstage "github.com/vyr-e/Backstage/go"
 )
 
 client := backstage.New(backstage.DefaultConfig())

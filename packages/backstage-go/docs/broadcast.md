@@ -5,7 +5,7 @@ Send messages to **all** workers (not just one). Useful for cache invalidation, 
 ## Send Broadcast
 
 ```go
-import backstage "github.com/backstage/go"
+import backstage "github.com/vyr-e/Backstage/go"
 
 client := backstage.New(backstage.DefaultConfig())
 
@@ -20,7 +20,7 @@ id, err := client.Broadcast(ctx, "cache.invalidate", map[string]string{
 Each worker receives all broadcast messages (via unique consumer group):
 
 ```go
-import backstage "github.com/backstage/go"
+import backstage "github.com/vyr-e/Backstage/go"
 
 rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
 

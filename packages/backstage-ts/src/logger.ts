@@ -127,6 +127,8 @@ export class Logger {
    * Log a debug message.
    */
   debug(message: string, payload?: Record<string, unknown>): void {
+    if (this.silent || !this.winston.isDebugEnabled()) return;
+    
     const entry: LogEntry = {
       level: LogLevel.DEBUG,
       message,
@@ -141,6 +143,8 @@ export class Logger {
    * Log an info message.
    */
   info(message: string, payload?: Record<string, unknown>): void {
+    if (this.silent || !this.winston.isInfoEnabled()) return;
+
     const entry: LogEntry = {
       level: LogLevel.INFO,
       message,
@@ -155,6 +159,8 @@ export class Logger {
    * Log a warning message.
    */
   warn(message: string, payload?: Record<string, unknown>): void {
+    if (this.silent || !this.winston.isWarnEnabled()) return;
+
     const entry: LogEntry = {
       level: LogLevel.WARN,
       message,
@@ -170,6 +176,8 @@ export class Logger {
    * Accepts a string or an Error object.
    */
   error(message: string | Error, payload?: Record<string, unknown>): void {
+    if (this.silent || !this.winston.isErrorEnabled()) return;
+
     if (message instanceof Error) {
       const entry: LogEntry = {
         level: LogLevel.ERROR,

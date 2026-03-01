@@ -48,7 +48,7 @@ await worker.start();
 ### Go
 
 ```bash
-go get github.com/backstage/go
+go get github.com/vyr-e/Backstage/go
 ```
 
 ```go

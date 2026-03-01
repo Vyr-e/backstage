@@ -3,7 +3,9 @@
  */
 
 import { Stream } from './stream';
+import { Queue } from './queue';
 import { Reclaimer } from './reclaimer';
+import { SoftTimeout, HardTimeout } from './exceptions';
 import { Logger, createLogger, LogLevel, type LoggerConfig } from './logger';
 import { ScriptRegistry } from './script-registry';
 import {
@@ -53,8 +55,15 @@ export class Worker {
   private tasks: Map<string, TaskConfig> = new Map();
   private running: boolean = false;
   private activeTasks: Set<Promise<void>> = new Set();
+  private registeredQueues: Set<string> = new Set();
   private reclaimerInterval: Timer | null = null;
   private schedulerInterval: Timer | null = null;
+  private ackFlushInterval: Timer | null = null;
+
+  // Batched ACK queues: streamKey -> messageIds[]
+  private pendingAcks: Map<string, string[]> = new Map();
+  private readonly ACK_BATCH_SIZE = 100;
+  private readonly ACK_FLUSH_INTERVAL = 50; // ms
 
   /**
    * Redis client used by this worker.
@@ -87,7 +96,17 @@ export class Worker {
     const redisUrl = this.buildRedisUrl();
     this._redis = new Bun.RedisClient(redisUrl);
 
-    this.stream = new Stream(this._redis, this.config.consumerGroup);
+    this.stream = new Stream(this._redis, this.config.consumerGroup, {
+      queues: this.config.queues,
+    });
+
+    // Track explicitly configured queues
+    if (this.config.queues) {
+      for (const q of this.config.queues) {
+        this.registeredQueues.add(q.name);
+      }
+    }
+
     this.reclaimer = new Reclaimer(
       this._redis,
       this.config.consumerGroup,
@@ -135,10 +154,22 @@ export class Worker {
       throw new Error(`Task '${taskName}' is already registered`);
     }
 
+    if (options.queue && !this.registeredQueues.has(options.queue)) {
+      this.registeredQueues.add(options.queue);
+      this.stream.addQueue(new Queue(options.queue)).catch((err) => {
+        this.logger.error(`Failed to register queue '${options.queue}'`, {
+          error: String(err),
+        });
+      });
+    }
+
     this.tasks.set(taskName, {
       name: taskName,
       handler: handler as TaskHandler,
       priority: options.priority ?? Priority.DEFAULT,
+      queue: options.queue,
+      softTimeout: options.softTimeout,
+      hardTimeout: options.hardTimeout,
       maxRetries: options.maxRetries ?? this.config.maxDeliveries,
       rateLimit: options.rateLimit,
     });
@@ -226,6 +257,12 @@ export class Worker {
       1000,
     );
 
+    // Start batched ACK flushing
+    this.ackFlushInterval = setInterval(
+      () => this.flushAcks(),
+      this.ACK_FLUSH_INTERVAL,
+    );
+
     await this.processLoop();
   }
 
@@ -247,6 +284,13 @@ export class Worker {
       clearInterval(this.schedulerInterval);
       this.schedulerInterval = null;
     }
+    if (this.ackFlushInterval) {
+      clearInterval(this.ackFlushInterval);
+      this.ackFlushInterval = null;
+    }
+
+    // Flush any remaining ACKs
+    await this.flushAcks();
 
     if (this.activeTasks.size > 0) {
       this.logger.info(`Waiting for ${this.activeTasks.size} active tasks...`);
@@ -269,7 +313,17 @@ export class Worker {
 
   private async processLoop(): Promise<void> {
     const streamKeys = this.stream.getStreamKeys();
+
+    // For high throughput, prefetch up to concurrency level
+    const prefetch = Math.max(this.config.prefetch, this.config.concurrency);
+
+    // Use '>' to read new (undelivered) messages
+    // The consumer group's start ID (set to '0' at creation) determines
+    // which messages are considered "new" - all messages from stream start
     const streamIds = streamKeys.map(() => '>');
+
+    // Track if we got messages last iteration (for BLOCK vs NOBLOCK decision)
+    let gotMessagesLastTime = false;
 
     while (this.running) {
       try {
@@ -281,30 +335,46 @@ export class Worker {
 
         // Calculate how many to fetch based on remaining capacity
         const available = this.config.concurrency - this.activeTasks.size;
-        const count = Math.min(this.config.prefetch, available);
+        const count = Math.min(prefetch, available);
 
-        const result = await this._redis.send('XREADGROUP', [
+        // Build XREADGROUP command
+        // Use NOBLOCK when actively processing for max throughput
+        // Only BLOCK when idle (no messages last time) to save CPU
+        const xreadArgs: string[] = [
           'GROUP',
           this.config.consumerGroup,
           this.config.workerId,
           'COUNT',
           String(count),
-          'BLOCK',
-          String(this.config.blockTimeout),
-          'STREAMS',
-          ...streamKeys,
-          ...streamIds,
-        ]);
+        ];
 
-        if (!result || !Array.isArray(result) || result.length === 0) {
+        if (!gotMessagesLastTime) {
+          // Idle - block and wait for messages
+          xreadArgs.push('BLOCK', String(this.config.blockTimeout));
+        }
+        // else: NOBLOCK - return immediately if no messages
+
+        xreadArgs.push('STREAMS', ...streamKeys, ...streamIds);
+
+        const result = await this._redis.send('XREADGROUP', xreadArgs);
+
+        // Bun's Redis client returns results in object format: {streamKey: [[msgId, fields], ...]}
+        // Standard Redis returns: [[streamKey, [[msgId, fields], ...]]]
+        // Handle both formats for compatibility
+        if (!result || typeof result !== 'object') {
+          gotMessagesLastTime = false;
           continue;
         }
 
-        for (const streamEntry of result) {
-          if (!Array.isArray(streamEntry) || streamEntry.length < 2) continue;
+        gotMessagesLastTime = true;
 
-          const [, messages] = streamEntry as [string, unknown[]];
-          if (!Array.isArray(messages)) continue;
+        // Handle Bun's object format: {streamKey: messages[]}
+        const entries = Array.isArray(result)
+          ? (result as [string, unknown[]][]) // Standard format
+          : (Object.entries(result) as [string, unknown[]][]); // Bun object format
+
+        for (const [streamKey, messages] of entries) {
+          if (!Array.isArray(messages) || messages.length === 0) continue;
 
           for (const msgEntry of messages) {
             if (!Array.isArray(msgEntry) || msgEntry.length < 2) continue;
@@ -312,14 +382,19 @@ export class Worker {
             const [msgId, fields] = msgEntry as [string, unknown[]];
             const message = this.parseMessage(msgId, fields);
             if (message) {
-              // Fire and forget - don't await, allows concurrency
-              this.handleMessage(streamEntry[0] as string, message);
+              // Fire and forget - adds to activeTasks and starts execution
+              this.handleMessage(streamKey, message);
             }
           }
         }
       } catch (err) {
         if (this.running) {
-          this.logger.error('Error in process loop', { error: String(err) });
+          const errorMsg = err instanceof Error ? err.message : String(err);
+          const stack = err instanceof Error ? err.stack : undefined;
+          this.logger.error('Error in process loop', {
+            error: errorMsg,
+            stack,
+          });
           await Bun.sleep(1000);
         }
       }
@@ -351,7 +426,7 @@ export class Worker {
 
     if (!task) {
       this.logger.warn(`Unknown task: ${message.taskName}`);
-      await this.ack(streamKey, message.id);
+      this.queueAck(streamKey, message.id);
       return;
     }
 
@@ -368,7 +443,31 @@ export class Worker {
     try {
       this.logger.debug(`Executing task: ${task.name}`);
 
-      const result = await task.handler(message.payload);
+      // Determine effective timeouts
+      // 1. Message-specific timeout (highest priority)
+      // 2. Task-specific hard timeout
+      // 3. Queue-specific hard timeout (if applicable - would need lookup)
+      // 4. No timeout
+
+      // TODO: We could look up the queue's hardTimeout if available
+
+      const hardTimeout = task.hardTimeout;
+
+      let result: void | WorkflowInstruction;
+
+      if (hardTimeout && hardTimeout > 0) {
+        result = await Promise.race([
+          task.handler(message.payload),
+          new Promise<never>((_, reject) =>
+            setTimeout(
+              () => reject(new HardTimeout(`Task exceeded ${hardTimeout}ms`)),
+              hardTimeout,
+            ),
+          ),
+        ]);
+      } else {
+        result = await task.handler(message.payload);
+      }
 
       if (result && typeof result === 'object' && 'next' in result) {
         const instruction = result as WorkflowInstruction;
@@ -389,18 +488,66 @@ export class Worker {
         );
       }
 
-      await this.ack(streamKey, message.id);
+      // Queue ACK for batched processing (much faster than individual ACKs)
+      this.queueAck(streamKey, message.id);
+
       this.logger.debug(`Completed: ${task.name}`);
     } catch (err) {
       this.logger.error(`Task failed: ${task.name}`, { error: String(err) });
     }
   }
 
-  private async ack(streamKey: string, messageId: string): Promise<void> {
+  /**
+   * Queue a message ACK for batched processing.
+   * ACKs are flushed periodically or when batch size is reached.
+   */
+  private queueAck(streamKey: string, messageId: string): void {
+    let pending = this.pendingAcks.get(streamKey);
+    if (!pending) {
+      pending = [];
+      this.pendingAcks.set(streamKey, pending);
+    }
+    pending.push(messageId);
+
+    // Flush immediately if batch size reached
+    if (pending.length >= this.ACK_BATCH_SIZE) {
+      this.flushStreamAcks(streamKey, pending).catch((err) => {
+        this.logger.error('Failed to flush ACKs', { error: String(err) });
+      });
+      this.pendingAcks.set(streamKey, []);
+    }
+  }
+
+  /**
+   * Flush all pending ACKs across all streams.
+   */
+  private async flushAcks(): Promise<void> {
+    const flushPromises: Promise<void>[] = [];
+
+    for (const [streamKey, messageIds] of this.pendingAcks) {
+      if (messageIds.length > 0) {
+        flushPromises.push(this.flushStreamAcks(streamKey, messageIds));
+        this.pendingAcks.set(streamKey, []);
+      }
+    }
+
+    await Promise.all(flushPromises);
+  }
+
+  /**
+   * Flush ACKs for a specific stream (batched XACK).
+   */
+  private async flushStreamAcks(
+    streamKey: string,
+    messageIds: string[],
+  ): Promise<void> {
+    if (messageIds.length === 0) return;
+
+    // XACK supports multiple message IDs in a single call
     await this._redis.send('XACK', [
       streamKey,
       this.config.consumerGroup,
-      messageId,
+      ...messageIds,
     ]);
   }
 
@@ -458,7 +605,7 @@ export class Worker {
       String(Date.now()),
     ]);
 
-    await this.ack(streamKey, message.id);
+    this.queueAck(streamKey, message.id);
   }
 
   private setupSignalHandlers(): void {

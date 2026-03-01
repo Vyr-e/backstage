@@ -285,6 +285,9 @@ export class Stream {
    * @param queue - The Queue instance to add
    */
   async addQueue(queue: Queue): Promise<void> {
+    if (this.customQueues.some((q) => q.name === queue.name)) {
+      return;
+    }
     await this.createConsumerGroup(queue.streamKey);
     this.customQueues.push(queue);
   }

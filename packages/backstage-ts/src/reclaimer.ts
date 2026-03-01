@@ -2,7 +2,12 @@
  * Backstage SDK - Reclaimer
  */
 
-import { type StreamMessage, type RedisClient, parseFields } from './types';
+import {
+  type StreamMessage,
+  type RedisClient,
+  parseFields,
+  type BackoffConfig,
+} from './types';
 import { Logger, createLogger, LogLevel, type LoggerConfig } from './logger';
 
 /**
@@ -68,6 +73,7 @@ export class Reclaimer {
     const claimed: StreamMessage[] = [];
 
     try {
+      // Get pending messages that are idle > idleTimeout (min threshold)
       const pending = await this.redis.send('XPENDING', [
         streamKey,
         this.consumerGroup,
@@ -85,12 +91,49 @@ export class Reclaimer {
       for (const entry of pending) {
         if (!Array.isArray(entry) || entry.length < 4) continue;
 
-        const [messageId, , , deliveryCount] = entry as [
+        const [messageId, consumer, idleTime, deliveryCount] = entry as [
           string,
           string,
           number,
           number,
         ];
+
+        // Fetch message details to check backoff
+        // We use XRANGE to peek without claiming
+        const messageDetails = await this.redis.send('XRANGE', [
+          streamKey,
+          messageId,
+          messageId,
+          'COUNT',
+          '1',
+        ]);
+
+        if (
+          !messageDetails ||
+          !Array.isArray(messageDetails) ||
+          messageDetails.length === 0
+        ) {
+          continue;
+        }
+
+        const [, fields] = messageDetails[0] as [string, unknown[]];
+        const data = parseFields(fields);
+
+        // Parse backoff config
+        let backoff: BackoffConfig | undefined;
+        if (data.backoff) {
+          try {
+            backoff = JSON.parse(data.backoff);
+          } catch {}
+        }
+
+        if (backoff) {
+          const requiredWait = this.calculateBackoff(backoff, deliveryCount);
+          if (idleTime < requiredWait) {
+            // Not ready yet
+            continue;
+          }
+        }
 
         try {
           const result = await this.redis.send('XCLAIM', [
@@ -104,12 +147,15 @@ export class Reclaimer {
           if (result && Array.isArray(result) && result.length > 0) {
             const firstResult = result[0];
             if (Array.isArray(firstResult) && firstResult.length >= 2) {
-              const [claimedId, fields] = firstResult as [string, unknown[]];
+              const [claimedId, claimedFields] = firstResult as [
+                string,
+                unknown[],
+              ];
 
-              if (fields && Array.isArray(fields)) {
+              if (claimedFields && Array.isArray(claimedFields)) {
                 const message = this.parseMessage(
                   claimedId,
-                  fields,
+                  claimedFields,
                   deliveryCount,
                 );
                 if (message) {
@@ -121,15 +167,46 @@ export class Reclaimer {
               }
             }
           }
-        } catch {
-          // Skip failed claims
+        } catch (err) {
+          this.logger.debug(`Failed to claim ${messageId}`, {
+            error: String(err),
+          });
         }
       }
-    } catch {
-      // Skip errors checking pending
+    } catch (err) {
+      this.logger.error('Error checking pending messages', {
+        error: String(err),
+        streamKey,
+      });
     }
 
     return claimed;
+  }
+
+  private calculateBackoff(config: BackoffConfig, attempts: number): number {
+    // Delivery count starts at 1. First retry is attempt 2.
+    // So if deliveryCount is 1, we shouldn't be here (it's new).
+    // If deliveryCount is 2, retry count is 1.
+
+    // We want the delay after the *previous* failure.
+    // So for deliveryCount X, we have failed X-1 times.
+
+    const retries = Math.max(0, attempts - 1);
+
+    if (config.type === 'fixed') {
+      return config.delay;
+    }
+
+    if (config.type === 'exponential') {
+      // Exponential backoff: delay * 2^(retries-1)
+      // First retry (retries=1): delay * 2^0 = delay * 1
+      // Second retry (retries=2): delay * 2^1 = delay * 2
+      const delay = config.delay * Math.pow(2, retries - 1);
+      const max = config.maxDelay ?? 3600000; // 1 hour default cap
+      return Math.min(delay, max);
+    }
+
+    return 0;
   }
 
   private parseMessage(

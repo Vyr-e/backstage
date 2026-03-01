@@ -37,7 +37,7 @@ export interface WorkflowInstruction {
  * Can return void for simple tasks, or WorkflowInstruction for chaining.
  */
 export type TaskHandler<T = unknown> = (
-  payload: T
+  payload: T,
 ) => Promise<void | WorkflowInstruction>;
 
 // =============================================================================
@@ -128,6 +128,12 @@ export interface TaskConfig<T = unknown> {
   handler: TaskHandler<T>;
   /** Default priority for this task */
   priority?: Priority;
+  /** Custom queue name (overrides priority) */
+  queue?: string;
+  /** Soft timeout in milliseconds */
+  softTimeout?: number;
+  /** Hard timeout in milliseconds */
+  hardTimeout?: number;
   /** Maximum retries before dead-letter */
   maxRetries?: number;
   /** Rate limit: max executions per second */
@@ -154,6 +160,8 @@ export interface WorkerConfig {
   workerId?: string;
   /** Consumer group name */
   consumerGroup?: string;
+  /** Custom queues to consume from */
+  queues?: import('./queue').Queue[];
   /** Block timeout for XREADGROUP in milliseconds */
   blockTimeout?: number;
   /** Reclaimer check interval in milliseconds */
@@ -189,6 +197,7 @@ export const DEFAULT_WORKER_CONFIG: Required<Omit<WorkerConfig, 'workerId'>> & {
   db: 0,
   workerId: '',
   consumerGroup: 'backstage-workers',
+  queues: [],
   blockTimeout: 5000,
   reclaimerInterval: 30000,
   idleTimeout: 60000,
@@ -201,6 +210,17 @@ export const DEFAULT_WORKER_CONFIG: Required<Omit<WorkerConfig, 'workerId'>> & {
 // =============================================================================
 // Enqueue Options
 // =============================================================================
+
+/**
+ * Backoff strategy configuration.
+ */
+export interface BackoffConfig {
+  type: 'fixed' | 'exponential';
+  /** Base delay in ms */
+  delay: number;
+  /** Maximum delay cap for exponential backoff */
+  maxDelay?: number;
+}
 
 /**
  * Options for enqueueing a task.
@@ -222,13 +242,7 @@ export interface EnqueueOptions {
   /** Maximum retry attempts for this job (overrides worker default) */
   attempts?: number;
   /** Backoff strategy for retries */
-  backoff?: {
-    type: 'fixed' | 'exponential';
-    /** Base delay in ms */
-    delay: number;
-    /** Maximum delay cap for exponential backoff */
-    maxDelay?: number;
-  };
+  backoff?: BackoffConfig;
   /** Job processing timeout in ms */
   timeout?: number;
 }
