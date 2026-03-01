@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -67,6 +68,7 @@ type Client struct {
 	redis         *redis.Client
 	config        Config
 	handlers      map[string]Handler
+	logger        *Logger
 	running       bool
 	
 	// Batched ACK support
@@ -104,6 +106,7 @@ func New(cfg Config) *Client {
 		redis:       rdb,
 		config:      cfg,
 		handlers:    make(map[string]Handler),
+		logger:      NewLogger("Backstage"),
 		pendingAcks: make(map[string][]string),
 		ackChan:     make(chan ackRequest, 1000), // Buffer for high throughput
 	}
@@ -120,6 +123,52 @@ func (c *Client) RegisterQueue(name string) {
 		}
 	}
 	c.customQueues = append(c.customQueues, name)
+}
+
+// LogQueues periodically logs statistics for all registered queues.
+func (c *Client) LogQueues(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			var queues []*Queue
+			
+			// Default queues
+			queues = append(queues, NewQueue(string(PriorityUrgent), WithPrefix(c.config.Prefix)))
+			queues = append(queues, NewQueue(string(PriorityDefault), WithPrefix(c.config.Prefix)))
+			queues = append(queues, NewQueue(string(PriorityLow), WithPrefix(c.config.Prefix)))
+
+			// Custom queues
+			c.queuesMu.RLock()
+			for _, name := range c.customQueues {
+				queues = append(queues, NewQueue(name, WithPrefix(c.config.Prefix)))
+			}
+			c.queuesMu.RUnlock()
+
+			info, err := Inspect(ctx, c.redis, queues)
+			if err != nil {
+				c.logger.Error("Failed to inspect queues", "error", err)
+				continue
+			}
+
+			for _, q := range info.Queues {
+				c.logger.Info("Queue status", 
+					"queue", q.Name, 
+					"pending", q.Pending, 
+					"scheduled", q.Scheduled, 
+					"dead_letter", q.DeadLetter)
+			}
+			c.logger.Info("Total status", 
+				"pending", info.TotalPending, 
+				"scheduled", info.TotalScheduled, 
+				"dead_letter", info.TotalDL)
+
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // Close closes the Redis connection.

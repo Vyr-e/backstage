@@ -15,12 +15,11 @@ func TestQueueCreation(t *testing.T) {
 }
 
 func TestQueueWithOptions(t *testing.T) {
-	q := NewQueue("urgent", QueueOptions{
-		Priority:    1,
-		SoftTimeout: 5000,
-		HardTimeout: 30000,
-		MaxRetries:  3,
-	})
+	q := NewQueue("urgent",
+		WithPriority(1),
+		WithTimeouts(5000, 30000),
+		WithMaxRetries(3),
+	)
 
 	if q.Priority != 1 {
 		t.Errorf("expected priority 1, got %d", q.Priority)

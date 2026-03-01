@@ -20,21 +20,38 @@ type Queue struct {
 	MaxRetries  int
 }
 
-func NewQueue(name string, opts ...QueueOptions) *Queue {
+type QueueOption func(*Queue)
+
+func NewQueue(name string, opts ...QueueOption) *Queue {
 	q := &Queue{
-		Name:     name,
-		Prefix:   StreamPrefix,
-		Priority: 0,
+		Name:   name,
+		Prefix: StreamPrefix,
 	}
 
-	if len(opts) > 0 {
-		q.Priority = opts[0].Priority
-		q.SoftTimeout = opts[0].SoftTimeout
-		q.HardTimeout = opts[0].HardTimeout
-		q.MaxRetries = opts[0].MaxRetries
+	for _, opt := range opts {
+		opt(q)
 	}
 
 	return q
+}
+
+func WithPriority(p int) QueueOption {
+	return func(q *Queue) { q.Priority = p }
+}
+
+func WithPrefix(prefix string) QueueOption {
+	return func(q *Queue) { q.Prefix = prefix }
+}
+
+func WithTimeouts(soft, hard int64) QueueOption {
+	return func(q *Queue) {
+		q.SoftTimeout = soft
+		q.HardTimeout = hard
+	}
+}
+
+func WithMaxRetries(retries int) QueueOption {
+	return func(q *Queue) { q.MaxRetries = retries }
 }
 
 func (q *Queue) StreamKey() string {
@@ -51,7 +68,7 @@ func (q *Queue) DeadLetterKey() string {
 
 // Default queues
 var (
-	QueueUrgent  = NewQueue("urgent", QueueOptions{Priority: 1})
-	QueueDefault = NewQueue("default", QueueOptions{Priority: 2})
-	QueueLow     = NewQueue("low", QueueOptions{Priority: 3})
+	QueueUrgent  = NewQueue("urgent", WithPriority(1))
+	QueueDefault = NewQueue("default", WithPriority(2))
+	QueueLow     = NewQueue("low", WithPriority(3))
 )
