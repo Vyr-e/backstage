@@ -4,9 +4,30 @@ package backstage
 
 import (
 	"context"
+	"strconv"
 
 	"github.com/redis/go-redis/v9"
 )
+
+func asInt64(val interface{}) (int64, bool) {
+	if val == nil {
+		return 0, false
+	}
+	switch v := val.(type) {
+	case int64:
+		return v, true
+	case int:
+		return int64(v), true
+	case float64:
+		return int64(v), true
+	case string:
+		i, err := strconv.ParseInt(v, 10, 64)
+		if err == nil {
+			return i, true
+		}
+	}
+	return 0, false
+}
 
 // QueueInfo contains statistics about a specific queue.
 type QueueInfo struct {

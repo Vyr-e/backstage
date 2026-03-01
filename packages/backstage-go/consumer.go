@@ -226,7 +226,7 @@ func (c *Client) processLoop(ctx context.Context, cfg ConsumerConfig) error {
 func (c *Client) handleMessage(ctx context.Context, streamKey string, msg redis.XMessage) {
 	taskName, _ := msg.Values["taskName"].(string)
 	payloadStr, _ := msg.Values["payload"].(string)
-	timeoutMs, _ := msg.Values["timeout"].(int64)
+	timeoutMs, _ := asInt64(msg.Values["timeout"])
 
 	handler, ok := c.handlers[taskName]
 	if !ok {
