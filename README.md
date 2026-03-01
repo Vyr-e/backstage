@@ -29,11 +29,13 @@ Backstage provides robust SDKs for building distributed background job processin
 ### TypeScript
 
 ```bash
-bun add @backstage/core
+bun add @vyr-e/backstage
+# or
+npm install @vyr-e/backstage
 ```
 
 ```typescript
-import { Worker } from '@backstage/core';
+import { Worker } from '@vyr-e/backstage';
 
 const worker = new Worker({ host: 'localhost', port: 6379 });
 
@@ -48,21 +50,21 @@ await worker.start();
 ### Go
 
 ```bash
-go get github.com/vyr-e/Backstage/go
+go get github.com/vyr-e/backstage/packages/backstage-go@v1.0.2
 ```
 
 ```go
-client := backstage.New(backstage.Config{
-    Host: "localhost",
-    Port: 6379,
-})
+import backstage "github.com/vyr-e/backstage/packages/backstage-go"
+
+client := backstage.New(backstage.DefaultConfig())
 
 client.On("order.process", func(ctx context.Context, payload json.RawMessage) (*backstage.WorkflowInstruction, error) {
     // Process the order
     return &backstage.WorkflowInstruction{Next: "email.receipt"}, nil
 })
 
-client.Start(context.Background())
+// Start worker pool
+client.Start(context.Background(), backstage.DefaultConsumerConfig())
 ```
 
 ## Development

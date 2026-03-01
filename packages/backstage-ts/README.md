@@ -2,13 +2,22 @@
 
 Background worker system using Redis Streams with at-least-once delivery.
 
+## Installation
+
+```bash
+bun add @vyr-e/backstage
+# or
+npm install @vyr-e/backstage
+```
+
 ## Features
 
 - **Multi-Priority Queues** - urgent, default, low + custom queues
 - **Job Deduplication** - prevent duplicate submissions with key + TTL
 - **Workflow Chaining** - return `{ next, delay, payload }` from handlers
 - **Cron Scheduling** - run tasks on cron schedules
-- **PEL Reclaimer** - automatic recovery of stuck messages
+- **PEL Reclaimer** - automatic recovery of stuck messages with backoff
+- **Batched ACKs** - high-throughput message acknowledgment
 - **Broadcast** - send messages to all workers
 - **Graceful Shutdown** - wait for active tasks before exit
 - **Dead-Letter Queue** - failed tasks after max retries
@@ -16,7 +25,7 @@ Background worker system using Redis Streams with at-least-once delivery.
 ## Quick Start
 
 ```typescript
-import { Worker } from '@backstage/core';
+import { Worker } from '@vyr-e/backstage';
 
 const worker = new Worker({
   host: 'localhost',
@@ -87,20 +96,22 @@ await worker.enqueue('payment.process', order, {
 ## Custom Queues
 
 ```typescript
-import { Queue, Stream } from '@backstage/core';
+import { Queue, Stream } from '@vyr-e/backstage';
 
 const notifQueue = new Queue('notifications', { priority: 1 });
 const analyticsQueue = new Queue('analytics', { priority: 10 });
 
-const stream = new Stream(redis, 'my-group', {
-  queues: [notifQueue, analyticsQueue],
+// Worker automatically monitors priority queues (urgent, default, low)
+// Plus any custom queues you provide
+const worker = new Worker({
+  queues: [notifQueue]
 });
 ```
 
 ## Cron Scheduler
 
 ```typescript
-import { Scheduler, CronTask } from '@backstage/core';
+import { Scheduler, CronTask } from '@vyr-e/backstage';
 
 const scheduler = new Scheduler({
   schedules: [
@@ -117,7 +128,7 @@ await scheduler.start();
 Send messages to all workers:
 
 ```typescript
-import { Broadcast } from '@backstage/core';
+import { Broadcast } from '@vyr-e/backstage';
 
 const broadcast = new Broadcast({ worker });
 await broadcast.initialize();

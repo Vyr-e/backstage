@@ -5,7 +5,7 @@ Background worker system using Redis Streams with at-least-once delivery.
 ## Installation
 
 ```bash
-go get github.com/vyr-e/backstage/packages/backstage-go
+go get github.com/vyr-e/backstage/packages/backstage-go@v1.0.2
 ```
 
 ## Quick Start
@@ -40,8 +40,27 @@ func main() {
         }, nil
     })
 
-    client.Start(context.Background())
+    // Start worker pool
+    client.Start(context.Background(), backstage.DefaultConsumerConfig())
 }
+```
+
+## Monitoring
+
+Periodically log queue statistics:
+
+```go
+// Log stats every 30 seconds
+go client.LogQueues(ctx, 30*time.Second)
+```
+
+## Custom Queues
+
+Listen to custom queues in addition to standard priorities:
+
+```go
+client.RegisterQueue("matching")
+client.Start(ctx, cfg)
 ```
 
 ## Enqueueing Tasks
@@ -105,9 +124,10 @@ client.Enqueue(ctx, "payment.process", order, backstage.EnqueueOptions{
 - Multi-priority queues (urgent, default, low) + custom queues
 - Job deduplication with TTL
 - Enhanced job options (attempts, backoff, timeout)
+- Batched ACKs for high throughput
 - Workflow chaining
 - Cron scheduling
-- PEL reclaimer
+- PEL reclaimer with backoff support
 - Broadcast messaging
 - Graceful shutdown
 - slog-based logging
