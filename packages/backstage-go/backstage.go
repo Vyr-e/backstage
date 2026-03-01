@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -67,6 +68,17 @@ type Client struct {
 	config        Config
 	handlers      map[string]Handler
 	running       bool
+	
+	// Batched ACK support
+	pendingAcks   map[string][]string // streamKey -> messageIDs
+	ackChan       chan ackRequest
+	ackWg         sync.WaitGroup
+	ackMu         sync.Mutex
+}
+
+type ackRequest struct {
+	stream string
+	id     string
 }
 
 // Handler is a task handler function.
@@ -85,9 +97,11 @@ func New(cfg Config) *Client {
 	})
 
 	return &Client{
-		redis:    rdb,
-		config:   cfg,
-		handlers: make(map[string]Handler),
+		redis:       rdb,
+		config:      cfg,
+		handlers:    make(map[string]Handler),
+		pendingAcks: make(map[string][]string),
+		ackChan:     make(chan ackRequest, 1000), // Buffer for high throughput
 	}
 }
 

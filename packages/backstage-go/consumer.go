@@ -64,6 +64,9 @@ func (c *Client) Start(ctx context.Context, cfg ConsumerConfig) error {
 		c.running = false
 	}()
 
+	// Start ACK flusher
+	go c.runAckFlusher(ctx)
+
 	// Start reclaimer
 	go c.runReclaimer(ctx, cfg)
 
@@ -74,9 +77,56 @@ func (c *Client) Start(ctx context.Context, cfg ConsumerConfig) error {
 	return c.processLoop(ctx, cfg)
 }
 
+func (c *Client) runAckFlusher(ctx context.Context) {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case req, ok := <-c.ackChan:
+			if !ok {
+				c.flushAllAcks(ctx)
+				return
+			}
+			c.ackMu.Lock()
+			c.pendingAcks[req.stream] = append(c.pendingAcks[req.stream], req.id)
+			if len(c.pendingAcks[req.stream]) >= 100 {
+				ids := c.pendingAcks[req.stream]
+				c.pendingAcks[req.stream] = nil
+				c.ackMu.Unlock()
+				c.redis.XAck(ctx, req.stream, c.config.ConsumerGroup, ids...)
+			} else {
+				c.ackMu.Unlock()
+			}
+		case <-ticker.C:
+			c.flushAllAcks(ctx)
+		case <-ctx.Done():
+			c.flushAllAcks(context.Background())
+			return
+		}
+	}
+}
+
+func (c *Client) flushAllAcks(ctx context.Context) {
+	c.ackMu.Lock()
+	defer c.ackMu.Unlock()
+
+	for stream, ids := range c.pendingAcks {
+		if len(ids) > 0 {
+			c.redis.XAck(ctx, stream, c.config.ConsumerGroup, ids...)
+			c.pendingAcks[stream] = nil
+		}
+	}
+}
+
+func (c *Client) queueAck(stream, id string) {
+	c.ackChan <- ackRequest{stream: stream, id: id}
+}
+
 // Stop stops the worker.
 func (c *Client) Stop() {
 	c.running = false
+	close(c.ackChan)
 }
 
 func (c *Client) initConsumerGroups(ctx context.Context) error {
@@ -176,15 +226,24 @@ func (c *Client) processLoop(ctx context.Context, cfg ConsumerConfig) error {
 func (c *Client) handleMessage(ctx context.Context, streamKey string, msg redis.XMessage) {
 	taskName, _ := msg.Values["taskName"].(string)
 	payloadStr, _ := msg.Values["payload"].(string)
+	timeoutMs, _ := msg.Values["timeout"].(int64)
 
 	handler, ok := c.handlers[taskName]
 	if !ok {
 		log.Printf("[Backstage] Unknown task: %s", taskName)
-		c.ack(ctx, streamKey, msg.ID)
+		c.queueAck(streamKey, msg.ID)
 		return
 	}
 
-	result, err := handler(ctx, json.RawMessage(payloadStr))
+	// Create a context for the task
+	taskCtx := ctx
+	if timeoutMs > 0 {
+		var cancel context.CancelFunc
+		taskCtx, cancel = context.WithTimeout(ctx, time.Duration(timeoutMs)*time.Millisecond)
+		defer cancel()
+	}
+
+	result, err := handler(taskCtx, json.RawMessage(payloadStr))
 	if err != nil {
 		log.Printf("[Backstage] Task failed: %s - %v", taskName, err)
 		return // Don't ACK - let reclaimer handle
@@ -199,11 +258,11 @@ func (c *Client) handleMessage(ctx context.Context, streamKey string, msg redis.
 		}
 	}
 
-	c.ack(ctx, streamKey, msg.ID)
+	c.queueAck(streamKey, msg.ID)
 }
 
 func (c *Client) ack(ctx context.Context, stream, id string) {
-	c.redis.XAck(ctx, stream, c.config.ConsumerGroup, id)
+	c.queueAck(stream, id)
 }
 
 func (c *Client) runReclaimer(ctx context.Context, cfg ConsumerConfig) {
@@ -240,6 +299,25 @@ func (c *Client) reclaimIdleMessages(ctx context.Context, cfg ConsumerConfig) {
 		}
 
 		for _, msg := range pending {
+			// Fetch full message to check backoff
+			fullMsg, err := c.redis.XRange(ctx, key, msg.ID, msg.ID).Result()
+			if err != nil || len(fullMsg) == 0 {
+				continue
+			}
+			redisMsg := fullMsg[0]
+
+			// Check backoff
+			backoffJSON, _ := redisMsg.Values["backoff"].(string)
+			if backoffJSON != "" {
+				var backoff BackoffConfig
+				if err := json.Unmarshal([]byte(backoffJSON), &backoff); err == nil {
+					requiredWait := c.calculateBackoff(backoff, int(msg.RetryCount))
+					if msg.Idle < time.Duration(requiredWait)*time.Millisecond {
+						continue // Not ready yet
+					}
+				}
+			}
+
 			claimed, err := c.redis.XClaim(ctx, &redis.XClaimArgs{
 				Stream:   key,
 				Group:    c.config.ConsumerGroup,
@@ -259,6 +337,32 @@ func (c *Client) reclaimIdleMessages(ctx context.Context, cfg ConsumerConfig) {
 			}
 		}
 	}
+}
+
+func (c *Client) calculateBackoff(config BackoffConfig, attempts int) int64 {
+	retries := attempts - 1
+	if retries < 0 {
+		retries = 0
+	}
+
+	if config.Type == BackoffFixed {
+		return config.Delay
+	}
+
+	if config.Type == BackoffExponential {
+		// delay * 2^(retries-1)
+		power := retries - 1
+		if power < 0 {
+			power = 0
+		}
+		delay := config.Delay * int64(1<<power)
+		if config.MaxDelay > 0 && delay > config.MaxDelay {
+			return config.MaxDelay
+		}
+		return delay
+	}
+
+	return 0
 }
 
 func (c *Client) moveToDeadLetter(ctx context.Context, priority Priority, msg redis.XMessage) {
