@@ -1,4 +1,4 @@
-module github.com/vyr-e/Backstage/go
+module github.com/vyr-e/backstage/packages/backstage-go
 
 go 1.22
 

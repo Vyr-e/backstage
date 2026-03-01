@@ -5,7 +5,7 @@ Background worker system using Redis Streams with at-least-once delivery.
 ## Installation
 
 ```bash
-go get github.com/vyr-e/Backstage/go
+go get github.com/vyr-e/backstage/packages/backstage-go
 ```
 
 ## Quick Start
@@ -17,7 +17,7 @@ import (
     "context"
     "encoding/json"
 
-    backstage "github.com/vyr-e/Backstage/go"
+    backstage "github.com/vyr-e/backstage/packages/backstage-go"
 )
 
 func main() {

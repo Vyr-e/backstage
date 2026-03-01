@@ -9,7 +9,7 @@ import (
     "context"
     "encoding/json"
 
-    backstage "github.com/vyr-e/Backstage/go"
+    backstage "github.com/vyr-e/backstage/packages/backstage-go"
 )
 
 client := backstage.New(backstage.Config{

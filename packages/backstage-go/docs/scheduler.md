@@ -7,7 +7,7 @@ Run tasks on cron schedules.
 ```go
 import (
     "context"
-    backstage "github.com/vyr-e/Backstage/go"
+    backstage "github.com/vyr-e/backstage/packages/backstage-go"
 )
 
 // Create cron tasks
