@@ -1,6 +1,6 @@
 # Backstage
 
-A production-ready background worker system using Redis Streams with at-least-once delivery guarantees.
+A background worker system using Redis Streams with at-least-once delivery guarantees.
 
 ## Overview
 
