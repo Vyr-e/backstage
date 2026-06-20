@@ -176,6 +176,13 @@ export interface WorkerConfig {
   prefetch?: number;
   /** Max concurrent tasks before waiting (backpressure) */
   concurrency?: number;
+  /**
+   * Delete a message from its stream after a successful ACK (XDEL follows
+   * XACK), keeping stream length bounded instead of growing forever. Off by
+   * default; safe when a single consumer group drains each work queue, and
+   * does not affect broadcast.
+   */
+  deleteOnAck?: boolean;
 }
 
 /**
@@ -205,6 +212,7 @@ export const DEFAULT_WORKER_CONFIG: Required<Omit<WorkerConfig, 'workerId'>> & {
   gracePeriod: 30000,
   prefetch: 10,
   concurrency: 50,
+  deleteOnAck: false,
 };
 
 // =============================================================================

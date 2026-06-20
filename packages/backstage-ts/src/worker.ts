@@ -549,6 +549,13 @@ export class Worker {
       this.config.consumerGroup,
       ...messageIds,
     ]);
+
+    // Optionally remove the now-processed entries so the stream stays bounded.
+    // XDEL runs only after a successful XACK, so it never touches unacked
+    // (in-flight) messages the reclaimer still needs.
+    if (this.config.deleteOnAck) {
+      await this._redis.send('XDEL', [streamKey, ...messageIds]);
+    }
   }
 
   private async runReclaimer(): Promise<void> {
