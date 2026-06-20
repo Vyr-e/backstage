@@ -53,6 +53,12 @@ type Config struct {
 	// Queues specifies the exact queues to subscribe to.
 	// If set, these replace the default priority queues (urgent, default, low).
 	Queues        []string
+	// DeleteOnAck removes a message from its stream after it is successfully
+	// processed and acknowledged (XDEL follows XACK), keeping stream length
+	// bounded instead of growing forever. Safe in the default pattern where a
+	// single consumer group drains each work queue; leave false if another
+	// consumer group replays the same streams. Does not affect broadcast.
+	DeleteOnAck   bool
 }
 
 // DefaultConfig returns sensible defaults.

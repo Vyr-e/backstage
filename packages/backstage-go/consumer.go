@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -94,7 +95,7 @@ func (c *Client) runAckFlusher(ctx context.Context) {
 				ids := c.pendingAcks[req.stream]
 				c.pendingAcks[req.stream] = nil
 				c.ackMu.Unlock()
-				c.redis.XAck(ctx, req.stream, c.config.ConsumerGroup, ids...)
+				c.ackAndMaybeDelete(ctx, req.stream, ids)
 			} else {
 				c.ackMu.Unlock()
 			}
@@ -113,9 +114,23 @@ func (c *Client) flushAllAcks(ctx context.Context) {
 
 	for stream, ids := range c.pendingAcks {
 		if len(ids) > 0 {
-			c.redis.XAck(ctx, stream, c.config.ConsumerGroup, ids...)
+			c.ackAndMaybeDelete(ctx, stream, ids)
 			c.pendingAcks[stream] = nil
 		}
+	}
+}
+
+// ackAndMaybeDelete acknowledges the given message IDs and, when DeleteOnAck is
+// enabled, removes them from the stream so its length stays bounded. XDEL runs
+// only after a successful XACK, so it never touches unacked (in-flight) entries
+// that the reclaimer still needs.
+func (c *Client) ackAndMaybeDelete(ctx context.Context, stream string, ids []string) {
+	if len(ids) == 0 {
+		return
+	}
+	c.redis.XAck(ctx, stream, c.config.ConsumerGroup, ids...)
+	if c.config.DeleteOnAck {
+		c.redis.XDel(ctx, stream, ids...)
 	}
 }
 
@@ -182,6 +197,18 @@ func (c *Client) processLoop(ctx context.Context, cfg ConsumerConfig) error {
 		}
 		if err != nil {
 			if c.running {
+				// A missing stream/group (NOGROUP) means our consumer groups
+				// were deleted out from under us — e.g. a failover, FLUSHDB, or
+				// manual ops. Recreate them and retry instead of spinning on the
+				// error forever.
+				if strings.Contains(err.Error(), "NOGROUP") {
+					log.Printf("[Backstage] Consumer group missing, recreating: %v", err)
+					if rerr := c.initConsumerGroups(ctx); rerr != nil {
+						log.Printf("[Backstage] Failed to recreate consumer groups: %v", rerr)
+						time.Sleep(time.Second)
+					}
+					continue
+				}
 				log.Printf("[Backstage] Read error: %v", err)
 				time.Sleep(time.Second)
 			}
