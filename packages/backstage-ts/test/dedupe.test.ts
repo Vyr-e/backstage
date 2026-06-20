@@ -4,7 +4,7 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { Stream } from '../src/stream';
 import { Queue } from '../src/queue';
-import { Priority, type RedisClient } from '../src/types';
+import { type RedisClient } from '../src/types';
 
 let redis: RedisClient;
 let stream: Stream;
@@ -136,17 +136,14 @@ describe('Custom Queues', () => {
     expect(Number(len)).toBeGreaterThan(0);
   });
 
-  test('stream keys include custom queues', () => {
+  test('custom queues replace default priority queues', () => {
     const keys = stream.getStreamKeys();
 
-    // Should include default priority queues
-    expect(keys).toContain('backstage:urgent');
-    expect(keys).toContain('backstage:default');
-    expect(keys).toContain('backstage:low');
-
-    // Should include custom queues
-    expect(keys).toContain('backstage:notifications');
-    expect(keys).toContain('backstage:analytics');
+    // Custom queues replace defaults entirely
+    expect(keys).toEqual(['backstage:notifications', 'backstage:analytics']);
+    expect(keys).not.toContain('backstage:urgent');
+    expect(keys).not.toContain('backstage:default');
+    expect(keys).not.toContain('backstage:low');
   });
 
   test('custom queues are sorted by priority', () => {

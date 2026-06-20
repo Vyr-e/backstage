@@ -2,7 +2,7 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { Stream } from '../src/stream';
 import { Queue } from '../src/queue';
 import { Worker } from '../src/worker';
-import { Priority, type RedisClient } from '../src/types';
+import { type RedisClient } from '../src/types';
 
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
 
@@ -30,13 +30,19 @@ describe('Queue Override — Stream', () => {
     ]);
   });
 
-  test('empty queues array overrides defaults', () => {
+  test('empty queues array falls back to defaults (Go parity)', () => {
+    // Matches backstage-go: an empty Queues list is treated as "use defaults",
+    // not "subscribe to nothing".
     const stream = new Stream({} as any, 'test-group', {
       queues: [],
     });
 
     const keys = stream.getStreamKeys();
-    expect(keys).toEqual([]);
+    expect(keys).toEqual([
+      'backstage:urgent',
+      'backstage:default',
+      'backstage:low',
+    ]);
   });
 
   test('multiple custom queues sorted by priority', () => {
@@ -141,16 +147,24 @@ describe('Queue Override — Integration', () => {
     expect(Number(len)).toBeGreaterThan(0);
   });
 
-  test('scheduled tasks get enqueued to custom queue', async () => {
+  test('past-due delay enqueues immediately to custom queue', async () => {
+    const before = Number(
+      await redis.send('XLEN', ['backstage:integration-queue']),
+    );
+
     const id = await stream.enqueue(
       'scheduled.test',
       { scheduled: true },
       { queue: 'integration-queue', delay: -1000 },
     );
     expect(id).toBeTruthy();
-    expect(String(id)).toStartWith('scheduled:');
+    // A past-due (<= 0) delay runs immediately: it returns a stream message id,
+    // not a scheduled id, and lands directly in the custom queue.
+    expect(String(id)).not.toStartWith('scheduled:');
 
-    const processed = await stream.processScheduledTasks();
-    expect(processed).toBeGreaterThan(0);
+    const after = Number(
+      await redis.send('XLEN', ['backstage:integration-queue']),
+    );
+    expect(after).toBeGreaterThan(before);
   });
 });

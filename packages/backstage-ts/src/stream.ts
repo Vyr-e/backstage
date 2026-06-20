@@ -92,7 +92,7 @@ export class Stream {
     this.consumerGroup = consumerGroup;
     this.prefix = config.prefix ?? STREAM_PREFIX;
     this.defaultPriority = config.defaultPriority ?? Priority.DEFAULT;
-    this.customQueues = config.queues ?? [];
+    this.customQueues = config.queues ? [...config.queues] : [];
   }
 
   /**
