@@ -11,7 +11,7 @@ import (
 
 func TestClientPrefix(t *testing.T) {
 	ctx := context.Background()
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+	rdb := redis.NewClient(&redis.Options{Addr: testRedisAddr()})
 	defer rdb.Close()
 	
 	if err := rdb.Ping(ctx).Err(); err != nil {

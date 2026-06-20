@@ -130,20 +130,7 @@ func (c *Client) Stop() {
 }
 
 func (c *Client) initConsumerGroups(ctx context.Context) error {
-	var streams []string
-	
-	// Default priority queues
-	priorities := []Priority{PriorityUrgent, PriorityDefault, PriorityLow}
-	for _, p := range priorities {
-		streams = append(streams, c.streamKey(p))
-	}
-
-	// Custom registered queues
-	c.queuesMu.RLock()
-	for _, q := range c.customQueues {
-		streams = append(streams, fmt.Sprintf("%s:%s", c.config.Prefix, q))
-	}
-	c.queuesMu.RUnlock()
+	streams := c.getQueues()
 
 	for _, key := range streams {
 		err := c.redis.XGroupCreateMkStream(ctx, key, c.config.ConsumerGroup, "0").Err()
@@ -157,20 +144,7 @@ func (c *Client) initConsumerGroups(ctx context.Context) error {
 
 
 func (c *Client) processLoop(ctx context.Context, cfg ConsumerConfig) error {
-	var streams []string
-	
-	// Default priority queues
-	priorities := []Priority{PriorityUrgent, PriorityDefault, PriorityLow}
-	for _, p := range priorities {
-		streams = append(streams, c.streamKey(p))
-	}
-
-	// Custom registered queues
-	c.queuesMu.RLock()
-	for _, q := range c.customQueues {
-		streams = append(streams, fmt.Sprintf("%s:%s", c.config.Prefix, q))
-	}
-	c.queuesMu.RUnlock()
+	streams := c.getQueues()
 
 	// Append ">" for each stream to read new messages
 	for range streams {
@@ -305,20 +279,7 @@ func (c *Client) runReclaimer(ctx context.Context, cfg ConsumerConfig) {
 }
 
 func (c *Client) reclaimIdleMessages(ctx context.Context, cfg ConsumerConfig) {
-	var streams []string
-	
-	// Default priority queues
-	priorities := []Priority{PriorityUrgent, PriorityDefault, PriorityLow}
-	for _, p := range priorities {
-		streams = append(streams, c.streamKey(p))
-	}
-
-	// Custom registered queues
-	c.queuesMu.RLock()
-	for _, q := range c.customQueues {
-		streams = append(streams, fmt.Sprintf("%s:%s", c.config.Prefix, q))
-	}
-	c.queuesMu.RUnlock()
+	streams := c.getQueues()
 
 	for _, key := range streams {
 		pending, err := c.redis.XPendingExt(ctx, &redis.XPendingExtArgs{

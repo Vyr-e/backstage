@@ -3,6 +3,7 @@ package backstage
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"testing"
 
@@ -23,7 +24,7 @@ func TestMain(m *testing.M) {
 	}
 
 	testRedis = redis.NewClient(&redis.Options{
-		Addr: host + ":" + port,
+		Addr: testRedisAddr(),
 	})
 
 	code := m.Run()
@@ -38,10 +39,27 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
+func testPort() int {
+	port := os.Getenv("REDIS_PORT")
+	if port == "" {
+		return 6379
+	}
+	p := 0
+	fmt.Sscanf(port, "%d", &p)
+	if p == 0 {
+		return 6379
+	}
+	return p
+}
+
+func testRedisAddr() string {
+	return fmt.Sprintf("localhost:%d", testPort())
+}
+
 func newTestClient() *Client {
 	return New(Config{
 		Host:          "localhost",
-		Port:          6379,
+		Port:          testPort(),
 		ConsumerGroup: "test-group",
 		WorkerID:      "test-worker",
 	})

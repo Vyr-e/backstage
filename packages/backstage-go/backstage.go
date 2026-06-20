@@ -50,6 +50,9 @@ type Config struct {
 	WorkerID      string
 	// Prefix for Redis keys (default: "backstage")
 	Prefix        string
+	// Queues specifies the exact queues to subscribe to.
+	// If set, these replace the default priority queues (urgent, default, low).
+	Queues        []string
 }
 
 // DefaultConfig returns sensible defaults.
@@ -135,17 +138,12 @@ func (c *Client) LogQueues(ctx context.Context, interval time.Duration) {
 		case <-ticker.C:
 			var queues []*Queue
 			
-			// Default queues
-			queues = append(queues, NewQueue(string(PriorityUrgent), WithPrefix(c.config.Prefix)))
-			queues = append(queues, NewQueue(string(PriorityDefault), WithPrefix(c.config.Prefix)))
-			queues = append(queues, NewQueue(string(PriorityLow), WithPrefix(c.config.Prefix)))
-
-			// Custom queues
-			c.queuesMu.RLock()
-			for _, name := range c.customQueues {
+			// Get active queues (respects Config.Queues override)
+			for _, streamKey := range c.getQueues() {
+				// Strip prefix to get queue name
+				name := streamKey[len(c.config.Prefix)+1:]
 				queues = append(queues, NewQueue(name, WithPrefix(c.config.Prefix)))
 			}
-			c.queuesMu.RUnlock()
 
 			info, err := Inspect(ctx, c.redis, queues)
 			if err != nil {
@@ -174,6 +172,33 @@ func (c *Client) LogQueues(ctx context.Context, interval time.Duration) {
 // Close closes the Redis connection.
 func (c *Client) Close() error {
 	return c.redis.Close()
+}
+
+// getQueues returns the list of queue stream keys to subscribe to.
+// If custom queues are configured via Config.Queues, those replace the defaults.
+// Otherwise, the three default priority queues are used.
+// Queues registered at runtime via RegisterQueue are always appended.
+func (c *Client) getQueues() []string {
+	var queues []string
+
+	if len(c.config.Queues) > 0 {
+		for _, q := range c.config.Queues {
+			queues = append(queues, fmt.Sprintf("%s:%s", c.config.Prefix, q))
+		}
+	} else {
+		priorities := []Priority{PriorityUrgent, PriorityDefault, PriorityLow}
+		for _, p := range priorities {
+			queues = append(queues, c.streamKey(p))
+		}
+	}
+
+	c.queuesMu.RLock()
+	for _, q := range c.customQueues {
+		queues = append(queues, fmt.Sprintf("%s:%s", c.config.Prefix, q))
+	}
+	c.queuesMu.RUnlock()
+
+	return queues
 }
 
 // streamKey returns the stream key for a priority.

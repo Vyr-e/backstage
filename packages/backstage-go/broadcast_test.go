@@ -14,7 +14,7 @@ func TestBroadcast(t *testing.T) {
 
 	// Setup Redis client
 	rdb := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
+		Addr: testRedisAddr(),
 	})
 	defer rdb.Close()
 

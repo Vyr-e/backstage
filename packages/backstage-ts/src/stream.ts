@@ -61,7 +61,7 @@ return processed
 export interface StreamConfig {
   prefix?: string;
   defaultPriority?: Priority;
-  /** Custom queues to initialize (in addition to default priority queues) */
+  /** Queues to subscribe to. If provided, these REPLACE the default priority queues (urgent, default, low). */
   queues?: Queue[];
 }
 
@@ -96,23 +96,25 @@ export class Stream {
   }
 
   /**
-   * Initialize consumer groups for all priority levels and custom queues.
+   * Initialize consumer groups for all queues.
    * Creates the streams if they don't exist.
+   * If custom queues are configured, only those are initialized (defaults are skipped).
    *
    * @returns Promise that resolves when initialization is complete
    */
   async initialize(): Promise<void> {
-    // Initialize default priority queues
-    const priorities = [Priority.URGENT, Priority.DEFAULT, Priority.LOW];
-
-    for (const priority of priorities) {
-      const streamKey = `${this.prefix}:${priority}`;
-      await this.createConsumerGroup(streamKey);
-    }
-
-    // Initialize custom queues
-    for (const queue of this.customQueues) {
-      await this.createConsumerGroup(queue.streamKey);
+    if (this.customQueues.length > 0) {
+      // Custom queues replace defaults entirely
+      for (const queue of this.customQueues) {
+        await this.createConsumerGroup(queue.streamKey);
+      }
+    } else {
+      // No custom queues — use default priority queues
+      const priorities = [Priority.URGENT, Priority.DEFAULT, Priority.LOW];
+      for (const priority of priorities) {
+        const streamKey = `${this.prefix}:${priority}`;
+        await this.createConsumerGroup(streamKey);
+      }
     }
   }
 
@@ -254,24 +256,26 @@ export class Stream {
 
   /**
    * Get all stream keys in priority order.
-   * Default queues come first (URGENT -> DEFAULT -> LOW), followed by custom queues sorted by priority.
+   * If custom queues are configured, only those are returned (sorted by priority).
+   * Otherwise, default queues are returned in order (URGENT -> DEFAULT -> LOW).
    *
    * @returns Array of Redis stream keys
    */
   getStreamKeys(): string[] {
-    const defaultKeys = [
+    if (this.customQueues.length > 0) {
+      // Custom queues replace defaults — sort by priority (lower = higher priority)
+      const sorted = [...this.customQueues].sort(
+        (a, b) => a.priority - b.priority,
+      );
+      return sorted.map((q) => q.streamKey);
+    }
+
+    // No custom queues — use default priority queues
+    return [
       `${this.prefix}:${Priority.URGENT}`,
       `${this.prefix}:${Priority.DEFAULT}`,
       `${this.prefix}:${Priority.LOW}`,
     ];
-
-    // Sort custom queues by priority (lower = higher priority)
-    const sortedCustom = [...this.customQueues].sort(
-      (a, b) => a.priority - b.priority,
-    );
-    const customKeys = sortedCustom.map((q) => q.streamKey);
-
-    return [...defaultKeys, ...customKeys];
   }
 
   getPrefix(): string {
