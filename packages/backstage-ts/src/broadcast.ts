@@ -137,14 +137,20 @@ export class Broadcast {
         '>',
       ]);
 
-      if (!result || !Array.isArray(result) || result.length === 0) {
+      // Bun's Redis client returns results in object format:
+      //   {streamKey: [[msgId, fields], ...]}
+      // Standard Redis returns:
+      //   [[streamKey, [[msgId, fields], ...]]]
+      // Handle both formats so broadcasts behave the same as the worker loop.
+      if (!result || typeof result !== 'object') {
         return messages;
       }
 
-      for (const streamEntry of result) {
-        if (!Array.isArray(streamEntry) || streamEntry.length < 2) continue;
+      const entries = Array.isArray(result)
+        ? (result as [string, unknown[]][])
+        : (Object.entries(result) as [string, unknown[]][]);
 
-        const [, streamMessages] = streamEntry as [string, unknown[]];
+      for (const [, streamMessages] of entries) {
         if (!Array.isArray(streamMessages)) continue;
 
         for (const msgEntry of streamMessages) {
