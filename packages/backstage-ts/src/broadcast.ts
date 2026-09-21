@@ -20,6 +20,8 @@ export interface BroadcastConfig {
   workerId?: string;
   /** Idle threshold for consumer cleanup in milliseconds (default: 1 hour) */
   consumerIdleThreshold?: number;
+  /** Where a newly created consumer group starts (default: latest) */
+  startPosition?: 'latest' | 'beginning';
   /** Logger configuration */
   loggerConfig?: LoggerConfig;
 }
@@ -41,6 +43,7 @@ export class Broadcast {
   private consumerGroup: string;
   private logger: Logger;
   private consumerIdleThreshold: number;
+  private startPosition: 'latest' | 'beginning';
 
   /**
    * Create a new Broadcast instance.
@@ -63,6 +66,7 @@ export class Broadcast {
 
     this.consumerGroup = `broadcast-${this.workerId}`;
     this.consumerIdleThreshold = config.consumerIdleThreshold ?? 60 * 60 * 1000; // 1 hour
+    this.startPosition = config.startPosition ?? 'latest';
     this.logger = createLogger({
       level: LogLevel.INFO,
       ...config.loggerConfig,
@@ -81,7 +85,7 @@ export class Broadcast {
         'CREATE',
         BROADCAST_STREAM,
         this.consumerGroup,
-        '0',
+        this.startPosition === 'beginning' ? '0' : '$',
         'MKSTREAM',
       ]);
       this.logger.debug(`Created consumer group: ${this.consumerGroup}`);

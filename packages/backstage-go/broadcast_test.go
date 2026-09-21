@@ -29,7 +29,7 @@ func TestBroadcast(t *testing.T) {
 			rdb.Del(ctx, keys...)
 		}
 	}()
-	
+
 	// Create client for sending broadcast
 	client := New(DefaultConfig())
 	defer client.Close()
@@ -43,7 +43,7 @@ func TestBroadcast(t *testing.T) {
 		}
 
 		listener := NewBroadcastListener(rdb, "worker-1", handler, DefaultBroadcastConfig())
-		
+
 		// Start listener in background
 		go func() {
 			if err := listener.Start(ctx); err != nil {
@@ -105,17 +105,17 @@ func TestBroadcast(t *testing.T) {
 		// Create listener with very short idle threshold
 		config := DefaultBroadcastConfig()
 		config.ConsumerIdleThreshold = 100 * time.Millisecond // fast cleanup
-		
+
 		listener := NewBroadcastListener(rdb, "worker-cleanup", nil, config)
-		
+
 		// Wait for ghost to be considered idle (no consumers implies idle)
-		
+
 		// Run cleanup
 		deleted, err := listener.Cleanup(ctx)
 		if err != nil {
 			t.Fatalf("Cleanup failed: %v", err)
 		}
-		
+
 		if deleted != 1 {
 			t.Errorf("Expected 1 deleted group, got %d", deleted)
 		}
@@ -128,4 +128,136 @@ func TestBroadcast(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestBroadcastSkipsHistoricalMessagesByDefault(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rdb := redis.NewClient(&redis.Options{Addr: testRedisAddr()})
+	defer rdb.Close()
+	if err := rdb.Del(ctx, BroadcastStream).Err(); err != nil {
+		t.Fatalf("clear broadcast stream: %v", err)
+	}
+	defer rdb.Del(context.Background(), BroadcastStream)
+
+	if err := rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: BroadcastStream,
+		Values: map[string]interface{}{
+			"taskName":   "old.broadcast",
+			"payload":    `{"old":true}`,
+			"enqueuedAt": "1",
+		},
+	}).Err(); err != nil {
+		t.Fatalf("seed old broadcast: %v", err)
+	}
+
+	received := make(chan BroadcastMessage, 1)
+	config := DefaultBroadcastConfig()
+	config.BlockTimeout = 25 * time.Millisecond
+	listener := NewBroadcastListener(rdb, "worker-latest", func(_ context.Context, msg BroadcastMessage) error {
+		received <- msg
+		return nil
+	}, config)
+	defer listener.Stop()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- listener.Start(ctx)
+	}()
+
+	select {
+	case msg := <-received:
+		t.Fatalf("new listener replayed historical broadcast %q", msg.TaskName)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	if err := rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: BroadcastStream,
+		Values: map[string]interface{}{
+			"taskName":   "new.broadcast",
+			"payload":    `{"old":false}`,
+			"enqueuedAt": "2",
+		},
+	}).Err(); err != nil {
+		t.Fatalf("send new broadcast: %v", err)
+	}
+
+	select {
+	case msg := <-received:
+		if msg.TaskName != "new.broadcast" {
+			t.Fatalf("received %q, want new.broadcast", msg.TaskName)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("new listener did not receive a broadcast sent after startup")
+	}
+
+	listener.Stop()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("listener stopped with error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("listener did not stop")
+	}
+}
+
+func TestBroadcastCanReplayHistoricalMessagesWhenRequested(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rdb := redis.NewClient(&redis.Options{Addr: testRedisAddr()})
+	defer rdb.Close()
+	if err := rdb.Del(ctx, BroadcastStream).Err(); err != nil {
+		t.Fatalf("clear broadcast stream: %v", err)
+	}
+	defer rdb.Del(context.Background(), BroadcastStream)
+
+	if err := rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: BroadcastStream,
+		Values: map[string]interface{}{
+			"taskName":   "old.broadcast",
+			"payload":    `{"replayed":true}`,
+			"enqueuedAt": "1",
+		},
+	}).Err(); err != nil {
+		t.Fatalf("seed old broadcast: %v", err)
+	}
+
+	received := make(chan BroadcastMessage, 1)
+	config := DefaultBroadcastConfig()
+	config.BlockTimeout = 25 * time.Millisecond
+	config.StartPosition = BroadcastStartBeginning
+	listener := NewBroadcastListener(rdb, "worker-replay", func(_ context.Context, msg BroadcastMessage) error {
+		received <- msg
+		return nil
+	}, config)
+	defer listener.Stop()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- listener.Start(ctx)
+	}()
+
+	select {
+	case msg := <-received:
+		if msg.TaskName != "old.broadcast" {
+			t.Fatalf("received %q, want old.broadcast", msg.TaskName)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("listener did not replay the historical broadcast")
+	}
+
+	listener.Stop()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("listener stopped with error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("listener did not stop")
+	}
 }

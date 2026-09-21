@@ -135,6 +135,10 @@ await broadcast.initialize();
 await broadcast.send('cache.invalidate', { key: 'users' });
 ```
 
+New listeners receive broadcasts sent after they initialize. To intentionally
+replay messages already retained in the stream, set
+`startPosition: 'beginning'` when constructing `Broadcast`.
+
 ## Environment Variables
 
 | Variable                   | Default           | Description    |

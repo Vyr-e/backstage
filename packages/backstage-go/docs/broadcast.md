@@ -47,8 +47,13 @@ go listener.Start(ctx)
 config := backstage.BroadcastConfig{
     ConsumerIdleThreshold: time.Hour,    // For ghost cleanup
     BlockTimeout:          5 * time.Second,
+    StartPosition:         backstage.BroadcastStartLatest,
 }
 ```
+
+New listeners start at `BroadcastStartLatest` by default and receive only
+broadcasts sent after startup. Set `StartPosition` to
+`BroadcastStartBeginning` only when retained broadcasts should be replayed.
 
 ## Ghost Consumer Cleanup
 

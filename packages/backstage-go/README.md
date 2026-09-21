@@ -5,7 +5,7 @@ Background worker system using Redis Streams with at-least-once delivery.
 ## Installation
 
 ```bash
-go get github.com/vyr-e/backstage/packages/backstage-go@v1.0.2
+go get github.com/vyr-e/backstage/packages/backstage-go@v1.0.4
 ```
 
 ## Quick Start

@@ -20,6 +20,51 @@ function createMockRedis(result: unknown) {
 }
 
 describe('Broadcast', () => {
+  test('starts new consumer groups after existing broadcasts by default', async () => {
+    const { client, calls } = createMockRedis(null);
+    const broadcast = new Broadcast({
+      redis: client,
+      workerId: 'server-new',
+      loggerConfig: { silent: true },
+    });
+
+    await broadcast.initialize();
+
+    expect(calls[0]).toEqual({
+      command: 'XGROUP',
+      args: [
+        'CREATE',
+        'backstage:broadcast',
+        'broadcast-server-new',
+        '$',
+        'MKSTREAM',
+      ],
+    });
+  });
+
+  test('can replay existing broadcasts when explicitly requested', async () => {
+    const { client, calls } = createMockRedis(null);
+    const broadcast = new Broadcast({
+      redis: client,
+      workerId: 'server-replay',
+      startPosition: 'beginning',
+      loggerConfig: { silent: true },
+    });
+
+    await broadcast.initialize();
+
+    expect(calls[0]).toEqual({
+      command: 'XGROUP',
+      args: [
+        'CREATE',
+        'backstage:broadcast',
+        'broadcast-server-replay',
+        '0',
+        'MKSTREAM',
+      ],
+    });
+  });
+
   test('reads Bun object-shaped XREADGROUP results', async () => {
     const { client, calls } = createMockRedis({
       'backstage:broadcast': [

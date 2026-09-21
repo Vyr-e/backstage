@@ -13,10 +13,22 @@ import (
 // BroadcastStream is the Redis stream key used for broadcast messages.
 const BroadcastStream = "backstage:broadcast"
 
+// BroadcastStartPosition controls where a newly created broadcast consumer
+// group begins reading.
+type BroadcastStartPosition string
+
+const (
+	// BroadcastStartLatest receives only broadcasts sent after the listener starts.
+	BroadcastStartLatest BroadcastStartPosition = "latest"
+	// BroadcastStartBeginning replays broadcasts already retained in the stream.
+	BroadcastStartBeginning BroadcastStartPosition = "beginning"
+)
+
 // BroadcastConfig for the broadcast listener.
 type BroadcastConfig struct {
 	ConsumerIdleThreshold time.Duration // Threshold for ghost consumer cleanup
 	BlockTimeout          time.Duration
+	StartPosition         BroadcastStartPosition
 }
 
 // DefaultBroadcastConfig returns sensible defaults.
@@ -24,6 +36,7 @@ func DefaultBroadcastConfig() BroadcastConfig {
 	return BroadcastConfig{
 		ConsumerIdleThreshold: time.Hour,
 		BlockTimeout:          5 * time.Second,
+		StartPosition:         BroadcastStartLatest,
 	}
 }
 
@@ -70,7 +83,11 @@ func NewBroadcastListener(rdb *redis.Client, workerID string, handler BroadcastH
 // The method returns when the context is canceled or Stop() is called.
 func (b *BroadcastListener) Start(ctx context.Context) error {
 	// Create unique consumer group for this worker
-	err := b.redis.XGroupCreateMkStream(ctx, BroadcastStream, b.consumerGroup, "0").Err()
+	startID := "$"
+	if b.config.StartPosition == BroadcastStartBeginning {
+		startID = "0"
+	}
+	err := b.redis.XGroupCreateMkStream(ctx, BroadcastStream, b.consumerGroup, startID).Err()
 	if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
 		return err
 	}

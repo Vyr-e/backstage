@@ -50,7 +50,7 @@ await worker.start();
 ### Go
 
 ```bash
-go get github.com/vyr-e/backstage/packages/backstage-go@v1.0.2
+go get github.com/vyr-e/backstage/packages/backstage-go@v1.0.4
 ```
 
 ```go
