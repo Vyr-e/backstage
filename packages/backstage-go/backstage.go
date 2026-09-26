@@ -221,3 +221,10 @@ func (c *Client) scheduledKey() string {
 func (c *Client) deadLetterKey(priority Priority) string {
 	return fmt.Sprintf("%s:%s:dead-letter", c.config.Prefix, priority)
 }
+
+// errorKey returns the key holding the last handler error for a message,
+// keyed by message ID so it survives across reclaim/retry attempts and can be
+// attached when the message is moved to the dead-letter stream.
+func (c *Client) errorKey(id string) string {
+	return fmt.Sprintf("%s:error:%s", c.config.Prefix, id)
+}

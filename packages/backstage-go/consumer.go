@@ -249,6 +249,10 @@ func (c *Client) processLoop(ctx context.Context, cfg ConsumerConfig) error {
 	return nil
 }
 
+// lastErrorTTL bounds how long a message's last handler error is retained.
+// It must comfortably exceed the max retry window (MaxDeliveries * backoff).
+const lastErrorTTL = time.Hour
+
 func (c *Client) handleMessage(ctx context.Context, streamKey string, msg redis.XMessage) {
 	taskName, _ := msg.Values["taskName"].(string)
 	payloadStr, _ := msg.Values["payload"].(string)
@@ -272,6 +276,10 @@ func (c *Client) handleMessage(ctx context.Context, streamKey string, msg redis.
 	result, err := handler(taskCtx, json.RawMessage(payloadStr))
 	if err != nil {
 		log.Printf("[Backstage] Task failed: %s - %v", taskName, err)
+		// Record the last error so it can be attached if this message is
+		// eventually dead-lettered. TTL keeps it from leaking when the task
+		// later succeeds. Non-fatal on failure — DLQ just falls back to "".
+		c.redis.Set(ctx, c.errorKey(msg.ID), err.Error(), lastErrorTTL)
 		return // Don't ACK - let reclaimer handle
 	}
 
@@ -400,6 +408,9 @@ func (c *Client) moveToDeadLetter(ctx context.Context, priority Priority, msg re
 	dlKey := c.deadLetterKey(priority)
 	sKey := c.streamKey(priority)
 
+	errKey := c.errorKey(msg.ID)
+	lastError, _ := c.redis.Get(ctx, errKey).Result()
+
 	c.redis.XAdd(ctx, &redis.XAddArgs{
 		Stream: dlKey,
 		Values: map[string]interface{}{
@@ -408,9 +419,11 @@ func (c *Client) moveToDeadLetter(ctx context.Context, priority Priority, msg re
 			"enqueuedAt":     msg.Values["enqueuedAt"],
 			"originalId":     msg.ID,
 			"deadLetteredAt": time.Now().UnixMilli(),
+			"error":          lastError,
 		},
 	})
 
+	c.redis.Del(ctx, errKey)
 	c.ack(ctx, sKey, msg.ID)
 }
 
