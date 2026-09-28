@@ -397,6 +397,40 @@ func TestRedisProviderCustomQueueDLQ(t *testing.T) {
 	}
 }
 
+
+func TestNewDefaultsToRedisStreamsProvider(t *testing.T) {
+	c := New(DefaultConfig())
+	defer c.Close()
+	if c.Provider().Name() != "redis-streams" {
+		t.Fatalf("expected redis-streams, got %s", c.Provider().Name())
+	}
+	if c.Redis() == nil {
+		t.Fatal("expected Redis client for default provider")
+	}
+	if _, ok := c.Provider().(*RedisStreamsProvider); !ok {
+		t.Fatal("expected *RedisStreamsProvider")
+	}
+}
+
+func TestNewEmptyConfigDefaultsToRedis(t *testing.T) {
+	// Zero-value Config must still pick Redis Streams (localhost:6379).
+	c := New(Config{})
+	defer c.Close()
+	if c.Provider().Name() != "redis-streams" {
+		t.Fatalf("expected redis-streams, got %s", c.Provider().Name())
+	}
+	if c.Redis() == nil {
+		t.Fatal("expected Redis client")
+	}
+}
+
+func TestNewWithHostPortStillRedis(t *testing.T) {
+	c := New(Config{Host: "localhost", Port: 6379, ConsumerGroup: "compat"})
+	defer c.Close()
+	if c.Provider().Name() != "redis-streams" {
+		t.Fatalf("expected redis-streams, got %s", c.Provider().Name())
+	}
+}
 func TestNewWithProviderUsesInjected(t *testing.T) {
 	p := newFakeProvider()
 	c := NewWithProvider(p, Config{Queues: []string{"default"}, WorkerID: "w"})

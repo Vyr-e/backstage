@@ -4,11 +4,28 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { Worker } from '../src/worker';
 import { Priority } from '../src/types';
+import { RedisStreamsProvider } from '../src/provider/redis';
 
 describe('Worker Tests', () => {
   test('creates worker with default config', () => {
     const worker = new Worker();
     expect(worker).toBeTruthy();
+  });
+
+  test('defaults to RedisStreamsProvider when provider is omitted', () => {
+    const bare = new Worker();
+    expect(bare.provider).toBeInstanceOf(RedisStreamsProvider);
+    expect(bare.provider.name).toBe('redis-streams');
+    expect(bare.redis).toBeTruthy();
+
+    const withHostPort = new Worker({
+      host: 'localhost',
+      port: 6379,
+      consumerGroup: 'compat-group',
+    });
+    expect(withHostPort.provider).toBeInstanceOf(RedisStreamsProvider);
+    expect(withHostPort.provider.name).toBe('redis-streams');
+    expect(withHostPort.redis).toBeTruthy();
   });
 
   test('creates worker with custom config', () => {

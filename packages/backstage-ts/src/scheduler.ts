@@ -10,6 +10,7 @@ export interface SchedulerConfig {
   port?: number;
   password?: string;
   db?: number;
+  /** Optional; omit to default to Redis Streams from host/port. */
   provider?: BackstageProvider;
   schedules?: CronTask[];
   queues?: Queue[];

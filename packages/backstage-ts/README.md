@@ -52,25 +52,25 @@ still construct a `RedisStreamsProvider` under the hood.
 
 ## Providers
 
+Redis Streams is the **default**. Use `host` / `port` (or `new Worker()`) —
+no `provider` required. Pass `provider` only to opt into RabbitMQ or Kafka.
+
 ```typescript
 import {
   Worker,
-  RedisStreamsProvider,
   RabbitMQProvider,
   KafkaProvider,
 } from '@vyr-e/backstage';
 
-// Explicit Redis
-const worker = new Worker({
-  provider: new RedisStreamsProvider({ host: 'localhost', port: 6379 }),
-});
+// Default Redis (no provider)
+const worker = new Worker({ host: 'localhost', port: 6379 });
 
-// RabbitMQ
+// RabbitMQ (opt-in)
 const rabbitWorker = new Worker({
   provider: new RabbitMQProvider({ url: 'amqp://guest:guest@localhost:5672' }),
 });
 
-// Kafka
+// Kafka (opt-in)
 const kafkaWorker = new Worker({
   provider: new KafkaProvider({ brokers: ['localhost:9092'] }),
 });
@@ -152,10 +152,11 @@ const worker = new Worker({
 ## Cron Scheduler
 
 ```typescript
-import { Scheduler, CronTask, RedisStreamsProvider } from '@vyr-e/backstage';
+import { Scheduler, CronTask } from '@vyr-e/backstage';
 
+// Defaults to Redis Streams (same as Worker)
 const scheduler = new Scheduler({
-  provider: new RedisStreamsProvider({ host: 'localhost' }),
+  host: 'localhost',
   schedules: [
     new CronTask('0 0 * * *', 'cleanup.daily'),
     new CronTask('*/5 * * * *', 'health.check'),
@@ -180,9 +181,9 @@ replay retained messages (Redis), set `startPosition: 'beginning'`.
 
 ## Migration (existing Redis users)
 
-1. **No required code changes** for `new Worker({ host, port })`.
-2. Prefer `new Worker({ provider: new RedisStreamsProvider({...}) })` for clarity.
-3. `worker.redis` still works when the provider is `RedisStreamsProvider`.
+1. **No required code changes** — `new Worker({ host, port })` and `new Worker()` still construct Redis Streams under the hood.
+2. Pass `provider` only when switching to RabbitMQ or Kafka (opt-in).
+3. `worker.redis` still works when using the default Redis provider.
 4. Dead-letter keys for custom queues are now `backstage:{queue}:dead-letter` (previously priority-based for Worker DLQ). Align Go consumers if they inspected DLQ by priority only.
 5. `Stream` / `Reclaimer` / `Broadcast` remain exported as thin façades over the provider.
 

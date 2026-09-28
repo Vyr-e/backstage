@@ -19,7 +19,11 @@ import type { BackstageProvider, MessageRef } from './provider/types';
 import { RedisStreamsProvider } from './provider/redis';
 
 export interface WorkerOptions extends WorkerConfig {
-  /** Inject a transport provider. When set, Redis host/port fields are ignored. */
+  /**
+   * Optional transport provider. Omit to use Redis Streams (default) from
+   * host/port/password/db. Pass RabbitMQProvider or KafkaProvider to opt in
+   * to another transport — existing Redis callers need no change.
+   */
   provider?: BackstageProvider;
 }
 

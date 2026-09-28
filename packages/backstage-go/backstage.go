@@ -55,7 +55,9 @@ type Config struct {
 	// DeleteOnAck removes a message from its stream after successful ACK
 	// (provider AckAndForget). Safe with a single consumer group per queue.
 	DeleteOnAck bool
-	// Provider injects a transport. When nil, New creates a RedisStreamsProvider.
+	// Provider injects a transport. When nil (the common path), New creates a
+	// RedisStreamsProvider from Host/Port/Password/DB — no migration required.
+	// Set only to opt into RabbitMQ or Kafka via NewWithProvider.
 	Provider Provider
 }
 
@@ -137,6 +139,8 @@ func New(cfg Config) *Client {
 }
 
 // NewWithProvider creates a Client bound to an explicit Provider.
+// Use this for non-Redis transports (RabbitMQ, Kafka). Existing Redis users
+// should keep calling New / DefaultConfig — Redis Streams remains the default.
 func NewWithProvider(provider Provider, cfg Config) *Client {
 	cfg.Provider = provider
 	return New(cfg)

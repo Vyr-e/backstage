@@ -44,35 +44,34 @@ func main() {
 
 All transport goes through `backstage.Provider`. Core never talks to Redis/Rabbit/Kafka directly for enqueue/consume/ack/reclaim/DLQ/schedule/broadcast.
 
+**Redis is the default.** `backstage.New(cfg)` / `DefaultConfig()` create a
+`RedisStreamsProvider` — existing users need no `NewWithProvider` call.
+Use `NewWithProvider` only to opt into RabbitMQ or Kafka.
+
 ```go
-// Explicit Redis provider
-rp := backstage.NewRedisStreamsProvider(backstage.RedisStreamsProviderConfig{
-    Host: "localhost", Port: 6379, Prefix: "backstage",
-})
-client := backstage.NewWithProvider(rp, backstage.Config{
-    ConsumerGroup: "my-app", WorkerID: "worker-1",
+// Default Redis (no NewWithProvider)
+client := backstage.New(backstage.Config{
+    Host: "localhost", Port: 6379, ConsumerGroup: "my-app",
 })
 
-// RabbitMQ
+// RabbitMQ (opt-in)
 rmq := backstage.NewRabbitMQProvider(backstage.RabbitMQProviderConfig{
     URL: "amqp://guest:guest@localhost:5672/",
 })
 client = backstage.NewWithProvider(rmq, backstage.Config{Queues: []string{"default"}})
 
-// Kafka
+// Kafka (opt-in)
 kp := backstage.NewKafkaProvider(backstage.KafkaProviderConfig{
     Brokers: []string{"localhost:9092"},
 })
 client = backstage.NewWithProvider(kp, backstage.Config{Queues: []string{"default"}})
 ```
 
-`backstage.New(cfg)` still creates a Redis Streams provider for backwards compatibility.
-
 ### Migration from pre-provider Client
 
 | Before | After |
 |--------|--------|
-| `New(Config{Host, Port, ...})` | Unchanged — still Redis |
+| `New(Config{Host, Port, ...})` / `DefaultConfig()` | Unchanged — still Redis Streams by default |
 | Direct Redis usage via `client` internals | Prefer `client.Provider()` / `client.Redis()` |
 | Wire keys (`backstage:{queue}`, DLQ, scheduled ZSET) | Unchanged — TS↔Go interop preserved |
 

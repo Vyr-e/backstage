@@ -1,6 +1,8 @@
 # Worker
 
-The Worker consumes tasks from Redis Streams using `XREADGROUP` with at-least-once delivery.
+The Worker consumes tasks from Redis Streams (the default provider) using
+`XREADGROUP` with at-least-once delivery. Pass `provider` only to opt into
+RabbitMQ or Kafka — `new Worker({ host, port })` needs no migration.
 
 ## Basic Usage
 
