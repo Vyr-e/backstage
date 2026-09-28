@@ -1,5 +1,3 @@
-// Package backstage broadcast implementation.
-// Implements a fan-out messaging pattern where tasks are delivered to all active workers.
 package backstage
 
 import (
@@ -10,26 +8,19 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// BroadcastStream is the Redis stream key used for broadcast messages.
-const BroadcastStream = "backstage:broadcast"
-
-// BroadcastStartPosition controls where a newly created broadcast consumer
-// group begins reading.
-type BroadcastStartPosition string
-
-const (
-	// BroadcastStartLatest receives only broadcasts sent after the listener starts.
-	BroadcastStartLatest BroadcastStartPosition = "latest"
-	// BroadcastStartBeginning replays broadcasts already retained in the stream.
-	BroadcastStartBeginning BroadcastStartPosition = "beginning"
-)
+// BroadcastStream is the default Redis stream key used for broadcast messages.
+const BroadcastStream = WirePrefix + ":broadcast"
 
 // BroadcastConfig for the broadcast listener.
 type BroadcastConfig struct {
-	ConsumerIdleThreshold time.Duration // Threshold for ghost consumer cleanup
+	ConsumerIdleThreshold time.Duration
 	BlockTimeout          time.Duration
 	StartPosition         BroadcastStartPosition
 }
+
+// BroadcastStartPosition controls where a newly created broadcast consumer
+// group begins reading. Alias kept for back-compat with existing callers.
+type BroadcastStartPosition = BroadcastStart
 
 // DefaultBroadcastConfig returns sensible defaults.
 func DefaultBroadcastConfig() BroadcastConfig {
@@ -51,12 +42,9 @@ type BroadcastMessage struct {
 // BroadcastHandler is called for each broadcast message.
 type BroadcastHandler func(ctx context.Context, msg BroadcastMessage) error
 
-// BroadcastListener listens for broadcast messages on all workers.
-// Unlike standard queues where one worker processes a message, broadcast messages
-// are delivered to ALL active workers (fan-out). This is achieved by creating
-// a unique consumer group for each worker instance.
+// BroadcastListener listens for broadcast messages on all workers via Provider.
 type BroadcastListener struct {
-	redis         *redis.Client
+	provider      Provider
 	consumerGroup string
 	consumerID    string
 	handler       BroadcastHandler
@@ -65,12 +53,18 @@ type BroadcastListener struct {
 	logger        *Logger
 }
 
-// NewBroadcastListener creates a broadcast listener.
-// Each worker gets its own consumer group to receive all messages.
+// NewBroadcastListener creates a broadcast listener backed by a Redis client.
+// Prefer NewBroadcastListenerFromProvider when you already have a Provider.
 func NewBroadcastListener(rdb *redis.Client, workerID string, handler BroadcastHandler, config BroadcastConfig) *BroadcastListener {
+	rp := NewRedisStreamsProvider(RedisStreamsProviderConfig{Redis: rdb})
+	return NewBroadcastListenerFromProvider(rp, workerID, handler, config)
+}
+
+// NewBroadcastListenerFromProvider creates a broadcast listener over any Provider.
+func NewBroadcastListenerFromProvider(provider Provider, workerID string, handler BroadcastHandler, config BroadcastConfig) *BroadcastListener {
 	return &BroadcastListener{
-		redis:         rdb,
-		consumerGroup: "broadcast-" + workerID,
+		provider:      provider,
+		consumerGroup: wireBroadcastGroup(workerID),
 		consumerID:    workerID,
 		handler:       handler,
 		config:        config,
@@ -78,48 +72,40 @@ func NewBroadcastListener(rdb *redis.Client, workerID string, handler BroadcastH
 	}
 }
 
-// Start begins listening for broadcast messages.
-// It runs a blocking loop that consumes messages from the worker's unique group.
-// The method returns when the context is canceled or Stop() is called.
+// Start begins listening for broadcast messages through the Provider.
 func (b *BroadcastListener) Start(ctx context.Context) error {
-	// Create unique consumer group for this worker
-	startID := "$"
-	if b.config.StartPosition == BroadcastStartBeginning {
-		startID = "0"
+	start := BroadcastStart(b.config.StartPosition)
+	if start == "" {
+		start = BroadcastStartLatest
 	}
-	err := b.redis.XGroupCreateMkStream(ctx, BroadcastStream, b.consumerGroup, startID).Err()
-	if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
+	if err := b.provider.EnsureBroadcast(ctx, b.consumerID, start); err != nil {
 		return err
 	}
 
 	b.running = true
+	blockMs := b.config.BlockTimeout.Milliseconds()
 
 	for b.running {
-		result, err := b.redis.XReadGroup(ctx, &redis.XReadGroupArgs{
-			Group:    b.consumerGroup,
-			Consumer: b.consumerID,
-			Streams:  []string{BroadcastStream, ">"},
-			Count:    10,
-			Block:    b.config.BlockTimeout,
-		}).Result()
-
-		if err == redis.Nil {
-			continue
-		}
+		msgs, err := b.provider.ConsumeBroadcast(ctx, b.consumerID, 10, blockMs)
 		if err != nil {
 			if b.running {
 				time.Sleep(time.Second)
 			}
 			continue
 		}
-
-		for _, stream := range result {
-			for _, msg := range stream.Messages {
-				b.handleMessage(ctx, msg)
+		if len(msgs) == 0 {
+			continue
+		}
+		var acked []string
+		for _, msg := range msgs {
+			if b.handleMessage(ctx, msg) {
+				acked = append(acked, msg.ID)
 			}
 		}
+		if len(acked) > 0 {
+			_ = b.provider.AckBroadcast(ctx, b.consumerID, acked)
+		}
 	}
-
 	return nil
 }
 
@@ -128,89 +114,24 @@ func (b *BroadcastListener) Stop() {
 	b.running = false
 }
 
-func (b *BroadcastListener) handleMessage(ctx context.Context, msg redis.XMessage) {
-	taskName, _ := msg.Values["taskName"].(string)
-	payloadStr, _ := msg.Values["payload"].(string)
-	enqueuedAtStr, _ := msg.Values["enqueuedAt"].(string)
-
-	var enqueuedAt int64
-	if enqueuedAtStr != "" {
-		enqueuedAt = parseInt64(enqueuedAtStr)
-	}
-
+func (b *BroadcastListener) handleMessage(ctx context.Context, msg MessageRef) bool {
 	bm := BroadcastMessage{
 		ID:         msg.ID,
-		TaskName:   taskName,
-		Payload:    json.RawMessage(payloadStr),
-		EnqueuedAt: enqueuedAt,
+		TaskName:   msg.TaskName,
+		Payload:    msg.Payload,
+		EnqueuedAt: msg.EnqueuedAt,
 	}
-
 	if b.handler != nil {
 		if err := b.handler(ctx, bm); err != nil {
 			b.logger.Error("broadcast handler error", "error", err)
-			return
-		}
-	}
-
-	// Acknowledge
-	b.redis.XAck(ctx, BroadcastStream, b.consumerGroup, msg.ID)
-}
-
-// Cleanup removes ghost consumer groups (consumers that have been idle beyond the threshold).
-// This prevents the accumulation of stale consumer groups from workers that have terminated.
-// It is typically called periodically by a maintenance task.
-func (b *BroadcastListener) Cleanup(ctx context.Context) (int, error) {
-	deleted := 0
-
-	groups, err := b.redis.XInfoGroups(ctx, BroadcastStream).Result()
-	if err != nil {
-		return 0, err
-	}
-
-	for _, group := range groups {
-		// Never delete our own group
-		if group.Name == b.consumerGroup {
-			continue
-		}
-
-		// Check if all consumers are ghosts
-		if b.isGroupIdle(ctx, group.Name) {
-			err := b.redis.XGroupDestroy(ctx, BroadcastStream, group.Name).Err()
-			if err == nil {
-				b.logger.Info("Deleted stale consumer group", "group", group.Name)
-				deleted++
-			}
-		}
-	}
-
-	return deleted, nil
-}
-
-// isGroupIdle checks if all consumers in a group are idle (ghosts).
-func (b *BroadcastListener) isGroupIdle(ctx context.Context, groupName string) bool {
-	consumers, err := b.redis.XInfoConsumers(ctx, BroadcastStream, groupName).Result()
-	if err != nil {
-		return false
-	}
-
-	if len(consumers) == 0 {
-		// No consumers = definitely stale
-		return true
-	}
-
-	for _, consumer := range consumers {
-		// If any consumer is active (not idle beyond threshold), don't delete
-		if consumer.Idle < b.config.ConsumerIdleThreshold {
 			return false
 		}
 	}
-
-	// All consumers are ghosts
 	return true
 }
 
-func parseInt64(s string) int64 {
-	var v int64
-	json.Unmarshal([]byte(s), &v)
-	return v
+// Cleanup removes ghost broadcast consumer groups via the Provider.
+func (b *BroadcastListener) Cleanup(ctx context.Context) (int, error) {
+	n, err := b.provider.CleanupBroadcastGhosts(ctx, b.config.ConsumerIdleThreshold.Milliseconds())
+	return int(n), err
 }

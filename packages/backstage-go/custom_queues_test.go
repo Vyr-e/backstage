@@ -178,7 +178,8 @@ func TestProcessLoopWithCustomQueues(t *testing.T) {
 	}
 
 	msg := result[0].Messages[0]
-	client.handleMessage(ctx, "backstage:process-queue", msg)
+	ref := xMessageToRef(msg, "backstage:process-queue", client.config.Prefix, 1)
+	client.handleMessage(ctx, *ref)
 
 	select {
 	case <-msgReceived:

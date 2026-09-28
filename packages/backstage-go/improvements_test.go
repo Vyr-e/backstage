@@ -117,7 +117,10 @@ func TestBackoffReclaimer(t *testing.T) {
 
 				for _, s := range result {
 					for _, msg := range s.Messages {
-						client.handleMessage(ctx, s.Stream, msg)
+						ref := xMessageToRef(msg, s.Stream, client.config.Prefix, 1)
+						if ref != nil {
+							client.handleMessage(ctx, *ref)
+						}
 					}
 				}
 			}

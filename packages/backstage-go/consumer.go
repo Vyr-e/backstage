@@ -1,10 +1,7 @@
-// Package backstage consumer implementation.
-// Handles worker pool management, job processing, and reliability features (reclaiming, dead-letter).
 package backstage
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -13,8 +10,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
-	"github.com/redis/go-redis/v9"
 )
 
 // ConsumerConfig for the worker.
@@ -24,8 +19,8 @@ type ConsumerConfig struct {
 	IdleTimeout       time.Duration
 	MaxDeliveries     int
 	GracePeriod       time.Duration
-	Prefetch          int64 // Max messages per XREADGROUP (backpressure)
-	Concurrency       int   // Max concurrent tasks (backpressure)
+	Prefetch          int64
+	Concurrency       int
 }
 
 // DefaultConsumerConfig returns sensible defaults.
@@ -46,35 +41,26 @@ func (c *Client) On(taskName string, handler Handler) {
 	c.handlers[taskName] = handler
 }
 
-// Start begins processing tasks.
+// Start begins processing tasks through the Provider.
 func (c *Client) Start(ctx context.Context, cfg ConsumerConfig) error {
 	c.running = true
 
-	// Create consumer groups
 	if err := c.initConsumerGroups(ctx); err != nil {
 		return fmt.Errorf("init consumer groups: %w", err)
 	}
 
-	// Handle signals
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
-
 	go func() {
 		<-sigChan
 		log.Println("[Backstage] Shutting down...")
 		c.running = false
 	}()
 
-	// Start ACK flusher
 	go c.runAckFlusher(ctx)
-
-	// Start reclaimer
 	go c.runReclaimer(ctx, cfg)
-
-	// Start scheduled task processor
 	go c.processScheduled(ctx)
 
-	// Main loop
 	return c.processLoop(ctx, cfg)
 }
 
@@ -84,20 +70,22 @@ func (c *Client) runAckFlusher(ctx context.Context) {
 
 	for {
 		select {
-		case req, ok := <-c.ackChan:
+		case msg, ok := <-c.ackChan:
 			if !ok {
 				c.flushAllAcks(ctx)
 				return
 			}
 			c.ackMu.Lock()
-			c.pendingAcks[req.stream] = append(c.pendingAcks[req.stream], req.id)
-			if len(c.pendingAcks[req.stream]) >= 100 {
-				ids := c.pendingAcks[req.stream]
-				c.pendingAcks[req.stream] = nil
-				c.ackMu.Unlock()
-				c.ackAndMaybeDelete(ctx, req.stream, ids)
-			} else {
-				c.ackMu.Unlock()
+			c.pendingAcks = append(c.pendingAcks, msg)
+			flush := len(c.pendingAcks) >= 100
+			var batch []MessageRef
+			if flush {
+				batch = c.pendingAcks
+				c.pendingAcks = nil
+			}
+			c.ackMu.Unlock()
+			if flush {
+				c.flushAckBatch(ctx, batch)
 			}
 		case <-ticker.C:
 			c.flushAllAcks(ctx)
@@ -110,71 +98,65 @@ func (c *Client) runAckFlusher(ctx context.Context) {
 
 func (c *Client) flushAllAcks(ctx context.Context) {
 	c.ackMu.Lock()
-	defer c.ackMu.Unlock()
-
-	for stream, ids := range c.pendingAcks {
-		if len(ids) > 0 {
-			c.ackAndMaybeDelete(ctx, stream, ids)
-			c.pendingAcks[stream] = nil
-		}
-	}
+	batch := c.pendingAcks
+	c.pendingAcks = nil
+	c.ackMu.Unlock()
+	c.flushAckBatch(ctx, batch)
 }
 
-// ackAndMaybeDelete acknowledges the given message IDs and, when DeleteOnAck is
-// enabled, removes them from the stream so its length stays bounded. XDEL runs
-// only after a successful XACK, so it never touches unacked (in-flight) entries
-// that the reclaimer still needs.
-func (c *Client) ackAndMaybeDelete(ctx context.Context, stream string, ids []string) {
-	if len(ids) == 0 {
+func (c *Client) flushAckBatch(ctx context.Context, messages []MessageRef) {
+	if len(messages) == 0 {
 		return
 	}
-	c.redis.XAck(ctx, stream, c.config.ConsumerGroup, ids...)
+	var err error
 	if c.config.DeleteOnAck {
-		c.redis.XDel(ctx, stream, ids...)
+		err = c.provider.AckAndForget(ctx, messages)
+	} else {
+		err = c.provider.Ack(ctx, messages)
+	}
+	if err != nil {
+		log.Printf("[Backstage] ACK failed: %v", err)
 	}
 }
 
-func (c *Client) queueAck(stream, id string) {
-	c.ackChan <- ackRequest{stream: stream, id: id}
+func (c *Client) queueAck(msg MessageRef) {
+	select {
+	case c.ackChan <- msg:
+	default:
+		// Channel full — ack synchronously to avoid unbounded growth.
+		c.flushAckBatch(context.Background(), []MessageRef{msg})
+	}
 }
 
 // Stop stops the worker.
 func (c *Client) Stop() {
 	c.running = false
-	close(c.ackChan)
+	select {
+	case <-c.ackChan:
+	default:
+	}
+	// Close ack channel once; recover if already closed.
+	func() {
+		defer func() { recover() }()
+		close(c.ackChan)
+	}()
 }
 
 func (c *Client) initConsumerGroups(ctx context.Context) error {
-	streams := c.getQueues()
-
-	for _, key := range streams {
-		err := c.redis.XGroupCreateMkStream(ctx, key, c.config.ConsumerGroup, "0").Err()
-		if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
-			return fmt.Errorf("XGroupCreate for %s: %w", key, err)
-		}
+	if rp, ok := c.provider.(*RedisStreamsProvider); ok {
+		rp.SetConsumerGroup(c.config.ConsumerGroup)
 	}
-
-	return nil
+	return c.provider.EnsureQueues(ctx, c.getQueueNames())
 }
 
-
 func (c *Client) processLoop(ctx context.Context, cfg ConsumerConfig) error {
-	streams := c.getQueues()
-
-	// Append ">" for each stream to read new messages
-	for range streams {
-		streams = append(streams, ">")
-	}
-
-	// Semaphore for concurrency control (backpressure)
+	queues := c.getQueueNames()
 	sem := make(chan struct{}, cfg.Concurrency)
 	var wg sync.WaitGroup
 
 	for c.running {
-		// Calculate available capacity
 		available := cfg.Concurrency - len(sem)
 		if available <= 0 {
-			// At capacity - wait for a slot
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
@@ -184,23 +166,15 @@ func (c *Client) processLoop(ctx context.Context, cfg ConsumerConfig) error {
 			count = int64(available)
 		}
 
-		result, err := c.redis.XReadGroup(ctx, &redis.XReadGroupArgs{
-			Group:    c.config.ConsumerGroup,
-			Consumer: c.config.WorkerID,
-			Streams:  streams,
-			Count:    count,
-			Block:    cfg.BlockTimeout,
-		}).Result()
-
-		if err == redis.Nil {
-			continue
-		}
+		messages, err := c.provider.Consume(ctx, ConsumeArgs{
+			Queues:        queues,
+			ConsumerGroup: c.config.ConsumerGroup,
+			ConsumerID:    c.config.WorkerID,
+			MaxMessages:   count,
+			BlockMs:       cfg.BlockTimeout.Milliseconds(),
+		})
 		if err != nil {
 			if c.running {
-				// A missing stream/group (NOGROUP) means our consumer groups
-				// were deleted out from under us — e.g. a failover, FLUSHDB, or
-				// manual ops. Recreate them and retry instead of spinning on the
-				// error forever.
 				if strings.Contains(err.Error(), "NOGROUP") {
 					log.Printf("[Backstage] Consumer group missing, recreating: %v", err)
 					if rerr := c.initConsumerGroups(ctx); rerr != nil {
@@ -214,76 +188,61 @@ func (c *Client) processLoop(ctx context.Context, cfg ConsumerConfig) error {
 			}
 			continue
 		}
+		if len(messages) == 0 {
+			continue
+		}
 
-		for _, stream := range result {
-			for _, msg := range stream.Messages {
-				// Acquire semaphore slot
-				sem <- struct{}{}
-				wg.Add(1)
-
-				// Process concurrently
-				go func(streamKey string, m redis.XMessage) {
-					defer func() {
-						<-sem // Release slot
-						wg.Done()
-					}()
-					c.handleMessage(ctx, streamKey, m)
-				}(stream.Stream, msg)
-			}
+		for _, msg := range messages {
+			sem <- struct{}{}
+			wg.Add(1)
+			go func(m MessageRef) {
+				defer func() {
+					<-sem
+					wg.Done()
+				}()
+				c.handleMessage(ctx, m)
+			}(msg)
 		}
 	}
 
-	// Wait for in-flight tasks
 	done := make(chan struct{})
 	go func() {
 		wg.Wait()
 		close(done)
 	}()
-
 	select {
 	case <-done:
 	case <-time.After(cfg.GracePeriod):
 		log.Printf("[Backstage] Grace period expired, forcing shutdown")
 	}
-
 	return nil
 }
 
-// lastErrorTTL bounds how long a message's last handler error is retained.
-// It must comfortably exceed the max retry window (MaxDeliveries * backoff).
-const lastErrorTTL = time.Hour
-
-func (c *Client) handleMessage(ctx context.Context, streamKey string, msg redis.XMessage) {
-	taskName, _ := msg.Values["taskName"].(string)
-	payloadStr, _ := msg.Values["payload"].(string)
-	timeoutMs, _ := asInt64(msg.Values["timeout"])
-
-	handler, ok := c.handlers[taskName]
+func (c *Client) handleMessage(ctx context.Context, msg MessageRef) {
+	handler, ok := c.handlers[msg.TaskName]
 	if !ok {
-		log.Printf("[Backstage] Unknown task: %s", taskName)
-		c.queueAck(streamKey, msg.ID)
+		log.Printf("[Backstage] Unknown task: %s", msg.TaskName)
+		c.queueAck(msg)
 		return
 	}
 
-	// Create a context for the task
 	taskCtx := ctx
-	if timeoutMs > 0 {
+	if msg.Timeout > 0 {
 		var cancel context.CancelFunc
-		taskCtx, cancel = context.WithTimeout(ctx, time.Duration(timeoutMs)*time.Millisecond)
+		taskCtx, cancel = context.WithTimeout(ctx, time.Duration(msg.Timeout)*time.Millisecond)
 		defer cancel()
 	}
 
-	result, err := handler(taskCtx, json.RawMessage(payloadStr))
+	result, err := handler(taskCtx, msg.Payload)
 	if err != nil {
-		log.Printf("[Backstage] Task failed: %s - %v", taskName, err)
-		// Record the last error so it can be attached if this message is
-		// eventually dead-lettered. TTL keeps it from leaking when the task
-		// later succeeds. Non-fatal on failure — DLQ just falls back to "".
-		c.redis.Set(ctx, c.errorKey(msg.ID), err.Error(), lastErrorTTL)
-		return // Don't ACK - let reclaimer handle
+		log.Printf("[Backstage] Task failed: %s - %v", msg.TaskName, err)
+		c.lastErrors.Store(msg.ID, err.Error())
+		if rp, ok := c.provider.(*RedisStreamsProvider); ok {
+			rp.RecordError(ctx, msg.ID, err.Error())
+		}
+		return
 	}
 
-	// Handle workflow chaining
 	if result != nil {
 		if result.Delay > 0 {
 			c.Schedule(ctx, result.Next, result.Payload, time.Duration(result.Delay)*time.Millisecond)
@@ -292,11 +251,7 @@ func (c *Client) handleMessage(ctx context.Context, streamKey string, msg redis.
 		}
 	}
 
-	c.queueAck(streamKey, msg.ID)
-}
-
-func (c *Client) ack(ctx context.Context, stream, id string) {
-	c.queueAck(stream, id)
+	c.queueAck(msg)
 }
 
 func (c *Client) runReclaimer(ctx context.Context, cfg ConsumerConfig) {
@@ -314,148 +269,34 @@ func (c *Client) runReclaimer(ctx context.Context, cfg ConsumerConfig) {
 }
 
 func (c *Client) reclaimIdleMessages(ctx context.Context, cfg ConsumerConfig) {
-	streams := c.getQueues()
-
-	for _, key := range streams {
-		pending, err := c.redis.XPendingExt(ctx, &redis.XPendingExtArgs{
-			Stream: key,
-			Group:  c.config.ConsumerGroup,
-			Idle:   cfg.IdleTimeout,
-			Start:  "-",
-			End:    "+",
-			Count:  10,
-		}).Result()
-
-		if err != nil {
-			continue
-		}
-
-		for _, msg := range pending {
-			// Fetch full message to check backoff
-			fullMsg, err := c.redis.XRange(ctx, key, msg.ID, msg.ID).Result()
-			if err != nil || len(fullMsg) == 0 {
-				continue
-			}
-			redisMsg := fullMsg[0]
-
-			// Check backoff
-			backoffJSON, _ := redisMsg.Values["backoff"].(string)
-			if backoffJSON != "" {
-				var backoff BackoffConfig
-				if err := json.Unmarshal([]byte(backoffJSON), &backoff); err == nil {
-					requiredWait := c.calculateBackoff(backoff, int(msg.RetryCount))
-					if msg.Idle < time.Duration(requiredWait)*time.Millisecond {
-						continue // Not ready yet
-					}
-				}
-			}
-
-			claimed, err := c.redis.XClaim(ctx, &redis.XClaimArgs{
-				Stream:   key,
-				Group:    c.config.ConsumerGroup,
-				Consumer: c.config.WorkerID,
-				MinIdle:  cfg.IdleTimeout,
-				Messages: []string{msg.ID},
-			}).Result()
-
-			if err != nil || len(claimed) == 0 {
-				continue
-			}
-
-			if msg.RetryCount > int64(cfg.MaxDeliveries) {
-				// Determine priority for DLQ
-				priority := PriorityDefault
-				if key == c.streamKey(PriorityUrgent) {
-					priority = PriorityUrgent
-				} else if key == c.streamKey(PriorityLow) {
-					priority = PriorityLow
-				}
-				c.moveToDeadLetter(ctx, priority, claimed[0])
-			} else {
-				c.handleMessage(ctx, key, claimed[0])
-			}
-		}
-	}
-}
-
-func (c *Client) calculateBackoff(config BackoffConfig, attempts int) int64 {
-	retries := attempts - 1
-	if retries < 0 {
-		retries = 0
-	}
-
-	if config.Type == BackoffFixed {
-		return config.Delay
-	}
-
-	if config.Type == BackoffExponential {
-		// delay * 2^(retries-1)
-		power := retries - 1
-		if power < 0 {
-			power = 0
-		}
-		delay := config.Delay * int64(1<<power)
-		if config.MaxDelay > 0 && delay > config.MaxDelay {
-			return config.MaxDelay
-		}
-		return delay
-	}
-
-	return 0
-}
-
-func (c *Client) moveToDeadLetter(ctx context.Context, priority Priority, msg redis.XMessage) {
-	dlKey := c.deadLetterKey(priority)
-	sKey := c.streamKey(priority)
-
-	errKey := c.errorKey(msg.ID)
-	lastError, _ := c.redis.Get(ctx, errKey).Result()
-
-	c.redis.XAdd(ctx, &redis.XAddArgs{
-		Stream: dlKey,
-		Values: map[string]interface{}{
-			"taskName":       msg.Values["taskName"],
-			"payload":        msg.Values["payload"],
-			"enqueuedAt":     msg.Values["enqueuedAt"],
-			"originalId":     msg.ID,
-			"deadLetteredAt": time.Now().UnixMilli(),
-			"error":          lastError,
-		},
+	claimed, err := c.provider.ReclaimIdle(ctx, ReclaimIdleArgs{
+		Queues:        c.getQueueNames(),
+		ConsumerGroup: c.config.ConsumerGroup,
+		ConsumerID:    c.config.WorkerID,
+		IdleMs:        cfg.IdleTimeout.Milliseconds(),
+		MaxCount:      10,
 	})
+	if err != nil {
+		return
+	}
 
-	c.redis.Del(ctx, errKey)
-	c.ack(ctx, sKey, msg.ID)
+	for _, msg := range claimed {
+		if msg.DeliveryCount > cfg.MaxDeliveries {
+			errStr := ""
+			if v, ok := c.lastErrors.Load(msg.ID); ok {
+				errStr, _ = v.(string)
+			}
+			_ = c.provider.DeadLetter(ctx, msg, DeadLetterMeta{
+				OriginalID:    msg.ID,
+				DeliveryCount: msg.DeliveryCount,
+				Error:         errStr,
+			})
+			c.lastErrors.Delete(msg.ID)
+		} else {
+			c.handleMessage(ctx, msg)
+		}
+	}
 }
-
-// Lua script for atomic scheduled task processing
-const processScheduledLuaConsumer = `
-local zsetKey = KEYS[1]
-local cutoff = tonumber(ARGV[1])
-local prefix = ARGV[2]
-local defaultPriority = ARGV[3]
-
-local tasks = redis.call('ZRANGEBYSCORE', zsetKey, '-inf', cutoff)
-local processed = 0
-
-for _, taskData in ipairs(tasks) do
-    local ok, task = pcall(cjson.decode, taskData)
-    if ok and task then
-        local priority = task.priority or defaultPriority
-        local streamKey = prefix .. ':' .. priority
-        
-        redis.call('XADD', streamKey, '*',
-            'taskName', task.taskName or '',
-            'payload', task.payload or '{}',
-            'enqueuedAt', tostring(task.enqueuedAt or 0)
-        )
-        
-        redis.call('ZREM', zsetKey, taskData)
-        processed = processed + 1
-    end
-end
-
-return processed
-`
 
 func (c *Client) processScheduled(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
@@ -464,18 +305,9 @@ func (c *Client) processScheduled(ctx context.Context) {
 	for c.running {
 		select {
 		case <-ticker.C:
-			now := time.Now().UnixMilli()
-
-			// Use atomic Lua script to prevent race conditions
-			c.redis.Eval(ctx, processScheduledLuaConsumer, []string{c.scheduledKey()},
-				now,
-				c.config.Prefix,
-				string(PriorityDefault),
-			)
-
+			_, _ = c.provider.PromoteDueScheduled(ctx, 0)
 		case <-ctx.Done():
 			return
 		}
 	}
 }
-

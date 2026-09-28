@@ -1,25 +1,17 @@
-// Package backstage scheduler implementation.
-// Manages cron-like schedules and moves delayed/scheduled tasks to active queues.
 package backstage
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
-
-	"github.com/redis/go-redis/v9"
 )
 
-// Scheduler manages cron-like recurrent tasks.
-// It checks properly configured schedules and enqueues tasks when they are due.
-// It also handles moving delayed/scheduled tasks from the ZSET to the active stream
-// when they become ready for processing.
+// Scheduler manages cron-like recurrent tasks via a Provider.
 type Scheduler struct {
-	redis     *redis.Client
+	provider  Provider
 	schedules []*CronTask
 	queues    map[string]*Queue
 	logger    *Logger
@@ -33,54 +25,16 @@ type SchedulerConfig struct {
 	Port            int
 	Password        string
 	DB              int
-	// Schedules list of cron tasks to run.
 	Schedules       []*CronTask
-	// Queues definitions for custom queues (used for resolving stream keys).
 	Queues          []*Queue
 	LogLevel        slog.Level
 	Silent          bool
-	Prefix          string // Stream key prefix (default: "backstage")
-	DefaultPriority string // Default priority name (default: "default")
+	Prefix          string
+	DefaultPriority string
+	Provider        Provider
 }
 
-// Lua script for atomic scheduled task processing
-// Prevents race conditions when multiple schedulers run
-const processScheduledLua = `
-local zsetKey = KEYS[1]
-local cutoff = tonumber(ARGV[1])
-local prefix = ARGV[2]
-local defaultPriority = ARGV[3]
-
-local tasks = redis.call('ZRANGEBYSCORE', zsetKey, '-inf', cutoff)
-local processed = 0
-
-for _, taskData in ipairs(tasks) do
-    local ok, task = pcall(cjson.decode, taskData)
-    if ok and task then
-        local priority = task.priority or defaultPriority
-        local streamKey = prefix .. ':' .. priority
-        
-        redis.call('XADD', streamKey, '*',
-            'taskName', task.taskName or '',
-            'payload', task.payload or '{}',
-            'enqueuedAt', tostring(task.enqueuedAt or 0)
-        )
-        
-        redis.call('ZREM', zsetKey, taskData)
-        processed = processed + 1
-    end
-end
-
-return processed
-`
-
 func NewScheduler(cfg SchedulerConfig) *Scheduler {
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
-		Password: cfg.Password,
-		DB:       cfg.DB,
-	})
-
 	prefix := cfg.Prefix
 	if prefix == "" {
 		prefix = StreamPrefix
@@ -92,8 +46,21 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 		queues[q.Name] = q
 	}
 
+	var provider Provider
+	if cfg.Provider != nil {
+		provider = cfg.Provider
+	} else {
+		provider = NewRedisStreamsProvider(RedisStreamsProviderConfig{
+			Host:     cfg.Host,
+			Port:     cfg.Port,
+			Password: cfg.Password,
+			DB:       cfg.DB,
+			Prefix:   prefix,
+		})
+	}
+
 	return &Scheduler{
-		redis:     rdb,
+		provider:  provider,
 		schedules: cfg.Schedules,
 		queues:    queues,
 		logger:    NewLogger("Scheduler", LoggerConfig{Level: cfg.LogLevel, Silent: cfg.Silent}),
@@ -101,12 +68,7 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 	}
 }
 
-// Start runs the scheduler loop.
-// It manages two main activities:
-// 1. Enqueueing recurrrent cron tasks when their schedule matches.
-// 2. Waiting for the next scheduled run.
-// Note: Moving scheduled tasks (ZSET -> Stream) is typically handled by
-// calling ProcessScheduledTasks periodically, or by a separate routine.
+// Start runs the scheduler loop, enqueueing cron tasks when due.
 func (s *Scheduler) Start(ctx context.Context) error {
 	if len(s.schedules) == 0 {
 		s.logger.Error("No schedules configured")
@@ -118,7 +80,6 @@ func (s *Scheduler) Start(ctx context.Context) error {
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
-
 	go func() {
 		<-sigChan
 		s.logger.Info("Shutting down...")
@@ -141,7 +102,6 @@ func (s *Scheduler) Start(ctx context.Context) error {
 		for _, task := range s.schedules {
 			next := task.NextRun(now)
 			delay := next.Sub(now)
-
 			if delay < minDelay {
 				minDelay = delay
 				upcoming = []*CronTask{task}
@@ -167,45 +127,27 @@ func (s *Scheduler) Stop() {
 }
 
 func (s *Scheduler) enqueueTask(ctx context.Context, task *CronTask) {
-	streamKey := s.prefix + ":default"
+	opts := PublishOptions{}
 	if task.Queue != nil {
-		streamKey = task.Queue.StreamKey()
+		opts.Queue = task.Queue.Name
 	}
-
-	s.redis.XAdd(ctx, &redis.XAddArgs{
-		Stream: streamKey,
-		Values: map[string]interface{}{
-			"taskName":   task.TaskName,
-			"payload":    "{}",
-			"enqueuedAt": time.Now().UnixMilli(),
-		},
-	})
-
+	if _, err := s.provider.Publish(ctx, task.TaskName, map[string]interface{}{}, opts); err != nil {
+		s.logger.Error("Failed to enqueue scheduled task", "task", task.TaskName, "error", err)
+		return
+	}
 	s.logger.Info("Enqueued scheduled task", "task", task.TaskName)
 }
 
-// ProcessScheduledTasks atomically moves due tasks from ZSET to streams.
-// It effectively "wakes up" tasks that were scheduled with a delay.
-// Uses a Lua script to identify tasks with score <= now, moves them to their
-// target stream, and removes them from the ZSET in one atomic operation.
+// ProcessScheduledTasks moves due delayed tasks into their work queues via the Provider.
 func (s *Scheduler) ProcessScheduledTasks(ctx context.Context, defaultPriority string) (int64, error) {
-	scheduledKey := s.prefix + ":scheduled"
-	now := time.Now().UnixMilli()
+	_ = defaultPriority
+	return s.provider.PromoteDueScheduled(ctx, 0)
+}
 
-	if defaultPriority == "" {
-		defaultPriority = "default"
+// Close closes the underlying provider.
+func (s *Scheduler) Close() error {
+	if s.provider != nil {
+		return s.provider.Close()
 	}
-
-	result, err := s.redis.Eval(ctx, processScheduledLua, []string{scheduledKey},
-		now,
-		s.prefix,
-		defaultPriority,
-	).Result()
-
-	if err != nil {
-		return 0, err
-	}
-
-	count, _ := result.(int64)
-	return count, nil
+	return nil
 }
