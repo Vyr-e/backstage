@@ -139,3 +139,22 @@ client.Enqueue(ctx, "payment.process", order, backstage.EnqueueOptions{
 - [Scheduler](docs/scheduler.md) - Cron jobs
 - [Logger](docs/logger.md) - slog integration
 - [Broadcast](docs/broadcast.md) - Pub/sub messaging
+
+
+## Provider architecture (v1.1.0)
+
+```go
+client := backstage.New(backstage.Config{
+  // Provider: nil → Redis Streams (default)
+  // Provider: rabbitmq.New(...), kafka.New(...),
+  // Capabilities: &backstage.Capabilities{Delays: ..., Dedupe: ...},
+})
+client.Publish(ctx, "ride.cancelled", payload)
+client.Subscribe("ride.cancelled", handler)
+client.Subscribe("ride.cancelled", handler, backstage.WithGroup("billing"))
+client.Capabilities()
+```
+
+RabbitMQ and Kafka ship as separate modules under `providers/`. Core keeps only `go-redis`.
+Legacy Broadcast is Redis-only and deprecated in favor of topics.
+See `docs/providers/`.
