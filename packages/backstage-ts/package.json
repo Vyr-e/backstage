@@ -48,29 +48,56 @@
       "types": "./dist/testing/index.d.ts",
       "import": "./dist/testing/index.js",
       "require": "./dist/testing/index.js"
+    },
+    "./rabbitmq": {
+      "types": "./dist/provider/rabbitmq/index.d.ts",
+      "import": "./dist/provider/rabbitmq/index.js",
+      "require": "./dist/provider/rabbitmq/index.js"
+    },
+    "./kafka": {
+      "types": "./dist/provider/kafka/index.d.ts",
+      "import": "./dist/provider/kafka/index.js",
+      "require": "./dist/provider/kafka/index.js"
     }
   },
   "scripts": {
     "dev": "bun run src/cli.ts",
-    "build": "bun build ./src/index.ts ./src/core.ts ./src/worker.ts ./src/queue.ts ./src/scheduler.ts ./src/reclaimer.ts ./src/types.ts ./src/testing/index.ts --outdir ./dist --target bun && tsc --project tsconfig.build.json --emitDeclarationOnly --outDir ./dist",
+    "build": "bun build ./src/index.ts ./src/core.ts ./src/worker.ts ./src/queue.ts ./src/scheduler.ts ./src/reclaimer.ts ./src/types.ts ./src/testing/index.ts ./src/provider/rabbitmq/index.ts ./src/provider/kafka/index.ts --outdir ./dist --target bun && tsc --project tsconfig.build.json --emitDeclarationOnly --outDir ./dist",
     "test": "bun test",
     "run-workers": "bun run src/cli.ts run-workers",
     "run-scheduler": "bun run src/cli.ts run-scheduler",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
+    "@types/amqplib": "^0.10.8",
     "@types/bun": "^1.3.8",
     "@types/node": "^20.0.0",
     "typescript": "^5.0.0"
   },
   "peerDependencies": {
     "typescript": "^5",
-    "bun": ">=1.0.0"
+    "bun": ">=1.0.0",
+    "amqplib": "",
+    "kafkajs": ""
   },
   "engines": {
     "bun": ">=1.0.0"
   },
   "dependencies": {
     "winston": "^3.19.0"
+  },
+  "peerDependenciesMeta": {
+    "amqplib": {
+      "optional": true
+    },
+    "kafkajs": {
+      "optional": true
+    },
+    "typescript": {
+      "optional": false
+    },
+    "bun": {
+      "optional": true
+    }
   }
 }
