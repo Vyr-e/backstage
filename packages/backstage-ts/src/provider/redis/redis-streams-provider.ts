@@ -40,6 +40,8 @@ export interface RedisStreamsProviderConfig {
   prefix?: string;
   topicMaxLen?: number;
   topicGroupIdleMs?: number;
+  /** Idle ms before topic reclaim (XPENDING IDLE / XCLAIM). Default 60000. */
+  idleTimeoutMs?: number;
   deleteOnAck?: boolean;
   /** Block timeout for XREADGROUP when idle (ms). */
   blockTimeout?: number;
@@ -133,6 +135,7 @@ export class RedisStreamsProvider implements BackstageProvider {
   readonly prefix: string;
   private readonly topicMaxLen: number;
   private readonly topicGroupIdleMs: number;
+  private readonly idleTimeoutMs: number;
   private readonly deleteOnAck: boolean;
   private readonly blockTimeout: number;
   private readonly reclaimIntervalMs: number;
@@ -147,6 +150,7 @@ export class RedisStreamsProvider implements BackstageProvider {
     this.prefix = config.prefix ?? STREAM_PREFIX;
     this.topicMaxLen = config.topicMaxLen ?? 10_000;
     this.topicGroupIdleMs = config.topicGroupIdleMs ?? 3_600_000;
+    this.idleTimeoutMs = config.idleTimeoutMs ?? 60_000;
     this.deleteOnAck = config.deleteOnAck ?? false;
     this.blockTimeout = config.blockTimeout ?? 5000;
     this.reclaimIntervalMs = config.reclaimIntervalMs ?? 30_000;
@@ -529,11 +533,12 @@ export class RedisStreamsProvider implements BackstageProvider {
       return (result as number) ?? 0;
     }
 
-    // Reclaim any stuck claimed members first (crash between claim and remove)
+    // Only retry claimed members older than 30s (score = claim time)
+    const claimAgeCutoff = Date.now() - 30_000;
     const stuck = (await this.redis.send('ZRANGEBYSCORE', [
       scheduledClaimedKey(this.prefix),
       '-inf',
-      '+inf',
+      String(claimAgeCutoff),
     ])) as string[];
     let n = 0;
     for (const raw of stuck ?? []) {
@@ -746,11 +751,12 @@ export class RedisStreamsProvider implements BackstageProvider {
     opts: TopicSubscribeOptions,
     onMessage: (m: TopicDelivery) => Promise<void>,
   ): Promise<void> {
+    const idle = String(this.idleTimeoutMs);
     const pending = await this.redis.send('XPENDING', [
       key,
       group,
       'IDLE',
-      '100',
+      idle,
       '-',
       '+',
       '10',
@@ -769,7 +775,7 @@ export class RedisStreamsProvider implements BackstageProvider {
           key,
           group,
           opts.consumerId,
-          '100',
+          idle,
           messageId,
         ]);
         if (!result || !Array.isArray(result) || result.length === 0) continue;

@@ -26,10 +26,12 @@ type RedisStreamsProviderConfig struct {
 	Prefix           string
 	TopicMaxLen      int64
 	TopicGroupIdleMs int64
-	DeleteOnAck      bool
-	BlockTimeout     time.Duration
-	ReclaimInterval  time.Duration
-	MaxDeliveries    int
+	// IdleTimeout is used for topic reclaim (XPENDING IDLE / XCLAIM MinIdle).
+	IdleTimeout     time.Duration
+	DeleteOnAck     bool
+	BlockTimeout    time.Duration
+	ReclaimInterval time.Duration
+	MaxDeliveries   int
 }
 
 type RedisStreamsProvider struct {
@@ -39,6 +41,7 @@ type RedisStreamsProvider struct {
 	prefix           string
 	topicMaxLen      int64
 	topicGroupIdleMs int64
+	idleTimeout      time.Duration
 	deleteOnAck      bool
 	blockTimeout     time.Duration
 	reclaimInterval  time.Duration
@@ -88,9 +91,13 @@ func NewRedisStreamsProvider(cfg RedisStreamsProviderConfig) *RedisStreamsProvid
 	if maxD == 0 {
 		maxD = 5
 	}
+	idle := cfg.IdleTimeout
+	if idle == 0 {
+		idle = 60 * time.Second
+	}
 	p := &RedisStreamsProvider{
 		name: "redis-streams", redis: rdb, scripts: NewScriptRegistry(rdb), prefix: prefix,
-		topicMaxLen: tmax, topicGroupIdleMs: tidle, deleteOnAck: cfg.DeleteOnAck,
+		topicMaxLen: tmax, topicGroupIdleMs: tidle, idleTimeout: idle, deleteOnAck: cfg.DeleteOnAck,
 		blockTimeout: block, reclaimInterval: reclaim, maxDeliveries: maxD, ownsClient: owns,
 	}
 	p.jobs = &redisJobs{p: p}
@@ -521,8 +528,11 @@ func (p *RedisStreamsProvider) PromoteCrossProvider(ctx context.Context) (int64,
 		n, _ := result.(int64)
 		return n, nil
 	}
-	// Retry stuck claimed first
-	stuck, _ := p.redis.ZRangeByScore(ctx, ScheduledClaimedKey(p.prefix), &redis.ZRangeBy{Min: "-inf", Max: "+inf"}).Result()
+	// Retry stuck claimed members older than 30s (score = claim time)
+	claimAgeCutoff := time.Now().Add(-30 * time.Second).UnixMilli()
+	stuck, _ := p.redis.ZRangeByScore(ctx, ScheduledClaimedKey(p.prefix), &redis.ZRangeBy{
+		Min: "-inf", Max: fmt.Sprintf("%d", claimAgeCutoff),
+	}).Result()
 	var n int64
 	for _, raw := range stuck {
 		if p.publishClaimed(ctx, jobs, raw) {

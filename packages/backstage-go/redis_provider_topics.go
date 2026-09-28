@@ -132,15 +132,19 @@ func (p *RedisStreamsProvider) handleTopicMsg(ctx context.Context, key, group, t
 }
 
 func (p *RedisStreamsProvider) reclaimTopics(ctx context.Context, key, group string, opts TopicSubscribeOptions, onMessage func(context.Context, TopicDelivery) error) {
+	idle := p.idleTimeout
+	if idle <= 0 {
+		idle = 60 * time.Second
+	}
 	pending, err := p.redis.XPendingExt(ctx, &redis.XPendingExtArgs{
-		Stream: key, Group: group, Idle: 100 * time.Millisecond, Start: "-", End: "+", Count: 10,
+		Stream: key, Group: group, Idle: idle, Start: "-", End: "+", Count: 10,
 	}).Result()
 	if err != nil {
 		return
 	}
 	for _, entry := range pending {
 		claimed, err := p.redis.XClaim(ctx, &redis.XClaimArgs{
-			Stream: key, Group: group, Consumer: opts.ConsumerID, MinIdle: 100 * time.Millisecond, Messages: []string{entry.ID},
+			Stream: key, Group: group, Consumer: opts.ConsumerID, MinIdle: idle, Messages: []string{entry.ID},
 		}).Result()
 		if err != nil || len(claimed) == 0 {
 			continue
