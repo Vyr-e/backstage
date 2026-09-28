@@ -59,6 +59,11 @@ type Config struct {
 	// single consumer group drains each work queue; leave false if another
 	// consumer group replays the same streams. Does not affect broadcast.
 	DeleteOnAck   bool
+
+	// Provider swaps the transport (nil = Redis Streams from Host/Port/...).
+	Provider Provider
+	// Capabilities plugs in or overrides optional capabilities.
+	Capabilities *Capabilities
 }
 
 // DefaultConfig returns sensible defaults.
@@ -79,16 +84,61 @@ type Client struct {
 	handlers      map[string]Handler
 	logger        *Logger
 	running       bool
-	
-	// Batched ACK support
-	pendingAcks   map[string][]string // streamKey -> messageIDs
-	ackChan       chan ackRequest
-	ackWg         sync.WaitGroup
-	ackMu         sync.Mutex
+	provider      Provider
+	resolved      ResolvedCapabilities
+	overrides     *Capabilities
+	redisProvider *RedisStreamsProvider
 
-	// Custom queues
-	customQueues  []string
-	queuesMu      sync.RWMutex
+	jobSub           Subscription
+	topicSubs        []Subscription
+	pendingTopicSubs []pendingTopicSub
+	subMu            sync.Mutex
+	consumerCfg      ConsumerConfig
+	promoteStop      chan struct{}
+
+	// Batched ACK support (legacy helpers for tests)
+	pendingAcks map[string][]string
+	ackChan     chan ackRequest
+	ackWg       sync.WaitGroup
+	ackMu       sync.Mutex
+
+	customQueues []string
+	queuesMu     sync.RWMutex
+}
+
+type pendingTopicSub struct {
+	topic   string
+	handler TopicHandler
+	group   string
+	from    TopicStart
+}
+
+// TopicHandler handles a topic message.
+type TopicHandler func(ctx context.Context, payload json.RawMessage, msg TopicMessage) error
+
+// TopicMessage is metadata delivered with a topic subscription.
+type TopicMessage struct {
+	ID          string
+	Topic       string
+	PublishedAt int64
+}
+
+// SubscribeOption configures Subscribe.
+type SubscribeOption func(*pendingTopicSub)
+
+// WithGroup delivers to exactly one instance per named group.
+func WithGroup(group string) SubscribeOption {
+	return func(s *pendingTopicSub) { s.group = group }
+}
+
+// FromEarliest starts a topic subscription from the beginning of the stream.
+func FromEarliest() SubscribeOption {
+	return func(s *pendingTopicSub) { s.from = TopicFromEarliest }
+}
+
+// FromLatest starts a topic subscription from new messages only (default).
+func FromLatest() SubscribeOption {
+	return func(s *pendingTopicSub) { s.from = TopicFromLatest }
 }
 
 type ackRequest struct {
@@ -104,21 +154,65 @@ func New(cfg Config) *Client {
 	if cfg.Prefix == "" {
 		cfg.Prefix = StreamPrefix
 	}
+	if cfg.ConsumerGroup == "" {
+		cfg.ConsumerGroup = "backstage-workers"
+	}
+	if cfg.Host == "" {
+		cfg.Host = "localhost"
+	}
+	if cfg.Port == 0 {
+		cfg.Port = 6379
+	}
 
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
-		Password: cfg.Password,
-		DB:       cfg.DB,
-	})
-
-	return &Client{
-		redis:       rdb,
+	c := &Client{
 		config:      cfg,
 		handlers:    make(map[string]Handler),
 		logger:      NewLogger("Backstage"),
 		pendingAcks: make(map[string][]string),
-		ackChan:     make(chan ackRequest, 1000), // Buffer for high throughput
+		ackChan:     make(chan ackRequest, 1000),
+		overrides:   cfg.Capabilities,
 	}
+
+	if cfg.Provider != nil {
+		c.provider = cfg.Provider
+		if rp, ok := cfg.Provider.(*RedisStreamsProvider); ok {
+			c.redisProvider = rp
+			c.redis = rp.Redis()
+		}
+	} else {
+		rp := NewRedisStreamsProvider(RedisStreamsProviderConfig{
+			Host: cfg.Host, Port: cfg.Port, Password: cfg.Password, DB: cfg.DB,
+			Prefix: cfg.Prefix, DeleteOnAck: cfg.DeleteOnAck,
+		})
+		c.provider = rp
+		c.redisProvider = rp
+		c.redis = rp.Redis()
+	}
+
+	resolved, err := ResolveCapabilities(c.provider, c.overrides)
+	if err != nil {
+		c.resolved = ResolvedCapabilities{}
+	} else {
+		c.resolved = resolved
+	}
+	_ = c.provider.Init(context.Background(), ProviderContext{
+		Capabilities: c.resolved,
+		Logger:       c.logger,
+	})
+	return c
+}
+
+// Redis returns the underlying Redis client when using RedisStreamsProvider.
+func (c *Client) Redis() *redis.Client {
+	if c.redis == nil {
+		panic("client.Redis() is only available when using RedisStreamsProvider")
+	}
+	return c.redis
+}
+
+// Capabilities returns the resolved capability report.
+func (c *Client) Capabilities() CapabilityReport {
+	return BuildCapabilityReport(c.provider, c.resolved, c.overrides)
 }
 
 // RegisterQueue adds a custom queue for the consumer to monitor.
@@ -175,9 +269,15 @@ func (c *Client) LogQueues(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// Close closes the Redis connection.
+// Close closes the provider (and Redis connection when owned).
 func (c *Client) Close() error {
-	return c.redis.Close()
+	if c.provider != nil {
+		return c.provider.Close()
+	}
+	if c.redis != nil {
+		return c.redis.Close()
+	}
+	return nil
 }
 
 // getQueues returns the list of queue stream keys to subscribe to.
@@ -209,22 +309,26 @@ func (c *Client) getQueues() []string {
 
 // streamKey returns the stream key for a priority.
 func (c *Client) streamKey(priority Priority) string {
-	return fmt.Sprintf("%s:%s", c.config.Prefix, priority)
+	return StreamKey(c.config.Prefix, string(priority))
 }
 
-// scheduledKey returns the scheduled tasks sorted set key.
 func (c *Client) scheduledKey() string {
-	return fmt.Sprintf("%s:scheduled", c.config.Prefix)
+	return ScheduledKey(c.config.Prefix)
 }
 
-// deadLetterKey returns the dead-letter stream key.
 func (c *Client) deadLetterKey(priority Priority) string {
-	return fmt.Sprintf("%s:%s:dead-letter", c.config.Prefix, priority)
+	return DeadLetterKey(c.config.Prefix, string(priority))
 }
 
-// errorKey returns the key holding the last handler error for a message,
-// keyed by message ID so it survives across reclaim/retry attempts and can be
-// attached when the message is moved to the dead-letter stream.
 func (c *Client) errorKey(id string) string {
-	return fmt.Sprintf("%s:error:%s", c.config.Prefix, id)
+	return ErrorKey(c.config.Prefix, id)
+}
+
+func (c *Client) queueNames() []string {
+	keys := c.getQueues()
+	names := make([]string, len(keys))
+	for i, k := range keys {
+		names[i] = QueueFromStreamKey(c.config.Prefix, k)
+	}
+	return names
 }

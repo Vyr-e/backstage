@@ -11,7 +11,7 @@ import (
 )
 
 // BroadcastStream is the Redis stream key used for broadcast messages.
-const BroadcastStream = "backstage:broadcast"
+const BroadcastStream = "backstage:broadcast" // legacy constant; prefer BroadcastStreamKey
 
 // BroadcastStartPosition controls where a newly created broadcast consumer
 // group begins reading.
