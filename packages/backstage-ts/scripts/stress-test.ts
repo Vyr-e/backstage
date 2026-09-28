@@ -64,7 +64,7 @@ async function main() {
 
   // Initialize stream consumer groups BEFORE enqueueing
   // This ensures messages can be properly consumed
-  await worker['stream'].initialize();
+  await worker.provider.ensureQueues(worker.getQueueNames());
 
   // --- PHASE 1: ENQUEUE ---
   console.log('🚀 Phase 1: Enqueueing...');
@@ -100,7 +100,7 @@ async function main() {
   console.log('\n⚙️  Phase 2: Processing...');
 
   // Debug: show which streams we're reading from
-  const streamKeys = worker['stream'].getStreamKeys();
+  const streamKeys = worker.getQueueNames().map((q) => `backstage:${q}`);
   console.log(`   Streams: ${streamKeys.join(', ')}`);
   console.log(`   Consumer group: ${worker['config'].consumerGroup}`);
 
