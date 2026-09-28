@@ -79,3 +79,27 @@ export {
   type WorkerConfig,
   type EnqueueOptions,
 } from './types';
+
+// Provider contract + wire format
+export type {
+  BackstageProvider,
+  MessageRef,
+  PublishOptions,
+  ProviderCapabilities,
+  ConsumeArgs,
+  ReclaimIdleArgs,
+  DeadLetterMeta,
+} from './provider';
+export {
+  WIRE_PREFIX,
+  WIRE_DEFAULT_CONSUMER_GROUP,
+  WIRE_SCHEDULED_KEY,
+  WIRE_BROADCAST_STREAM,
+  WIRE_FIELD,
+  wireStreamKey,
+  wireDeadLetterKey,
+  wireDedupeKey,
+  wireBroadcastGroup,
+  queueFromStreamKey,
+} from './wire';
+
