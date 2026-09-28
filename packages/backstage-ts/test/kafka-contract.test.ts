@@ -3,24 +3,19 @@ import { KafkaProvider, ContiguousOffsetTracker } from '../src/provider/kafka';
 import { runProviderContract } from '../src/testing';
 import { RedisStreamsProvider } from '../src/provider/redis';
 
-async function kafkaReachable(): Promise<boolean> {
-  try {
-    const { Kafka } = await import('kafkajs');
-    const k = new Kafka({
-      clientId: 'ping',
-      brokers: [process.env.KAFKA_BROKER ?? 'localhost:9092'],
-      connectionTimeout: 1000,
-      requestTimeout: 1000,
-      retry: { retries: 0 },
-    });
-    const admin = k.admin();
-    await admin.connect();
-    await admin.listTopics();
-    await admin.disconnect();
-    return true;
-  } catch {
-    return false;
-  }
+async function assertKafkaUp(): Promise<void> {
+  const { Kafka } = await import('kafkajs');
+  const k = new Kafka({
+    clientId: 'ping',
+    brokers: [process.env.KAFKA_BROKER ?? 'localhost:9092'],
+    connectionTimeout: 2000,
+    requestTimeout: 2000,
+    retry: { retries: 1 },
+  });
+  const admin = k.admin();
+  await admin.connect();
+  await admin.listTopics();
+  await admin.disconnect();
 }
 
 describe('ContiguousOffsetTracker', () => {
@@ -31,7 +26,7 @@ describe('ContiguousOffsetTracker', () => {
     t.markUnsettled('3');
     t.markSettled('1');
     expect(t.contiguousCommitOffset()).toBe('1');
-    t.markSettled('3'); // out of order — must not skip 2
+    t.markSettled('3');
     expect(t.contiguousCommitOffset()).toBe('1');
     t.markSettled('2');
     expect(t.contiguousCommitOffset()).toBe('3');
@@ -40,12 +35,9 @@ describe('ContiguousOffsetTracker', () => {
 
 describe('KafkaProvider contract', () => {
   test(
-    'passes shared contract suite with Redis delays (skips if Kafka unreachable)',
+    'passes shared contract suite with Redis delays against real broker',
     async () => {
-      if (!(await kafkaReachable())) {
-        console.log('SKIP: Kafka not reachable on localhost:9092');
-        return;
-      }
+      await assertKafkaUp();
       const prefix = `kafka-${Date.now()}`;
       const redisDelays = new RedisStreamsProvider({
         prefix: `${prefix}-delays`,
@@ -66,7 +58,6 @@ describe('KafkaProvider contract', () => {
             brokers: [process.env.KAFKA_BROKER ?? 'localhost:9092'],
             prefix,
           });
-          // Plug Redis delays via a wrapper after init
           const originalInit = p.init.bind(p);
           p.init = async (ctx) => {
             await originalInit({
@@ -82,10 +73,92 @@ describe('KafkaProvider contract', () => {
           };
           return p;
         },
-        { timeoutMs: 45_000 },
+        { timeoutMs: 60_000 },
       );
       await redisDelays.close();
     },
-    { timeout: 90_000 },
+    { timeout: 120_000 },
   );
+});
+
+describe('Kafka production fixes', () => {
+  test('reconnect after broker kill mid-consume', async () => {
+    await assertKafkaUp();
+    const prefix = `krecon-${Date.now()}`;
+    const redisDelays = new RedisStreamsProvider({ prefix: `${prefix}-d` });
+    await redisDelays.init({
+      capabilities: {
+        jobs: redisDelays.jobs,
+        delays: redisDelays.delays,
+      },
+      logger: { info() {}, warn() {}, error() {}, debug() {} } as any,
+    });
+    const p = new KafkaProvider({
+      brokers: [process.env.KAFKA_BROKER ?? 'localhost:9092'],
+      prefix,
+    });
+    await p.init({
+      capabilities: {
+        jobs: p.jobs,
+        topics: p.topics,
+        delays: redisDelays.delays,
+      },
+      logger: { info() {}, warn() {}, error() {}, debug() {} } as any,
+    });
+    const q = 'work';
+    await p.jobs.ensureQueues([q]);
+    const processed: string[] = [];
+    const sub = await p.jobs.consume(
+      {
+        queues: [q],
+        group: `g-${prefix}`,
+        consumerId: 'c',
+        prefetch: 2,
+        idleTimeout: 1000,
+      },
+      async (d) => {
+        processed.push((d.payload as any).id);
+        await d.ack();
+      },
+    );
+    await p.jobs.publish({
+      queue: q,
+      taskName: 't',
+      payload: { id: 'before' },
+      enqueuedAt: Date.now(),
+      meta: {},
+    });
+    const t0 = Date.now();
+    while (!processed.includes('before') && Date.now() - t0 < 20_000) await Bun.sleep(100);
+    expect(processed).toContain('before');
+
+    await Bun.$`sudo docker stop bs-kafka`.quiet();
+    await Bun.sleep(2000);
+    await Bun.$`sudo docker start bs-kafka`.quiet();
+    await Bun.sleep(10000);
+
+    let pubOk = false;
+    for (let i = 0; i < 8; i++) {
+      try {
+        await p.jobs.publish({
+          queue: q,
+          taskName: 't',
+          payload: { id: 'after' },
+          enqueuedAt: Date.now(),
+          meta: {},
+        });
+        pubOk = true;
+        break;
+      } catch {
+        await Bun.sleep(2000);
+      }
+    }
+    expect(pubOk).toBe(true);
+    const t1 = Date.now();
+    while (!processed.includes('after') && Date.now() - t1 < 45_000) await Bun.sleep(200);
+    await sub.stop();
+    await p.close();
+    await redisDelays.close();
+    expect(processed).toContain('after');
+  }, 120_000);
 });

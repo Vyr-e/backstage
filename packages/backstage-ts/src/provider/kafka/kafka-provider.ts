@@ -15,6 +15,8 @@ export interface KafkaProviderConfig {
   brokers?: string[];
   clientId?: string;
   prefix?: string;
+  /** Max topic delivery attempts before drop. Default 5. */
+  maxDeliveries?: number;
 }
 
 type KafkaMsg = {
@@ -33,26 +35,29 @@ export class KafkaProvider implements BackstageProvider {
   readonly name = 'kafka';
   readonly jobs: JobsCapability;
   readonly topics: TopicsCapability;
-  // no delays, no dedupe
 
   private readonly brokers: string[];
   private readonly clientId: string;
   private readonly prefix: string;
+  private readonly maxDeliveries: number;
   private ctx: ProviderContext | null = null;
   private Kafka!: any;
   private kafka: any;
   private producer: any;
+  private closed = false;
 
   constructor(config: KafkaProviderConfig = {}) {
     this.brokers = config.brokers ?? ['localhost:9092'];
     this.clientId = config.clientId ?? 'backstage';
     this.prefix = config.prefix ?? 'backstage';
+    this.maxDeliveries = config.maxDeliveries ?? 5;
     this.jobs = this.createJobs();
     this.topics = this.createTopics();
   }
 
   async init(ctx: ProviderContext): Promise<void> {
     this.ctx = ctx;
+    this.closed = false;
     try {
       const mod = await import('kafkajs');
       this.Kafka = mod.Kafka;
@@ -64,6 +69,7 @@ export class KafkaProvider implements BackstageProvider {
     this.kafka = new this.Kafka({
       clientId: this.clientId,
       brokers: this.brokers,
+      retry: { retries: 8 },
     });
     this.producer = this.kafka.producer({
       idempotent: true,
@@ -73,6 +79,7 @@ export class KafkaProvider implements BackstageProvider {
   }
 
   async close(): Promise<void> {
+    this.closed = true;
     try {
       await this.producer?.disconnect();
     } catch {
@@ -97,8 +104,16 @@ export class KafkaProvider implements BackstageProvider {
         await admin.connect();
         try {
           const topics = queues.flatMap((q) => [
-            { topic: self.topicForQueue(q), numPartitions: 1, replicationFactor: 1 },
-            { topic: self.dlqTopic(q), numPartitions: 1, replicationFactor: 1 },
+            {
+              topic: self.topicForQueue(q),
+              numPartitions: 1,
+              replicationFactor: 1,
+            },
+            {
+              topic: self.dlqTopic(q),
+              numPartitions: 1,
+              replicationFactor: 1,
+            },
           ]);
           await admin.createTopics({ topics, waitForLeaders: true });
         } finally {
@@ -120,126 +135,183 @@ export class KafkaProvider implements BackstageProvider {
           messages: [{ value }],
         });
         const r0 = result?.[0];
-        return r0 ? `${r0.topicName}:${r0.partition}:${r0.baseOffset}` : `kafka-${Date.now()}`;
+        return r0
+          ? `${r0.topicName}:${r0.partition}:${r0.baseOffset}`
+          : `kafka-${Date.now()}`;
       },
       async consume(
         opts: ConsumeOptions,
         onDelivery: (d: JobDelivery) => Promise<void>,
       ): Promise<Subscription> {
-        const consumer = self.kafka.consumer({ groupId: opts.group });
-        await consumer.connect();
-        const topics = opts.queues.map((q) => self.topicForQueue(q));
-        for (const t of topics) {
-          await consumer.subscribe({ topic: t, fromBeginning: true });
-        }
-
-        // Per-partition contiguous offset tracker
-        const trackers = new Map<string, ContiguousOffsetTracker>();
         let running = true;
-        let inFlight = 0;
+        let stopResolve: (() => void) | null = null;
+        const stopped = new Promise<void>((r) => {
+          stopResolve = r;
+        });
 
-        const run = consumer.run({
-          autoCommit: false,
-          eachMessage: async ({ topic, partition, message }: { topic: string; partition: number; message: KafkaMsg }) => {
-            if (!running) return;
-            while (inFlight >= opts.prefetch) {
-              await Bun.sleep(10);
-              if (!running) return;
-            }
-            inFlight++;
-            const key = `${topic}:${partition}`;
-            let tracker = trackers.get(key);
-            if (!tracker) {
-              tracker = new ContiguousOffsetTracker();
-              trackers.set(key, tracker);
-            }
-            const offset = message.offset;
-            tracker.markUnsettled(offset);
-            const queue = topic.startsWith(self.prefix + '.')
-              ? topic.slice(self.prefix.length + 1).replace(/\.dead-letter$/, '')
-              : topic;
-            // strip queue name if it was prefix.queue
-            const qName = opts.queues.find((q) => self.topicForQueue(q) === topic) ?? queue;
-
-            let body: any = {};
+        const loop = (async () => {
+          let backoff = 1000;
+          while (running && !self.closed) {
+            const consumer = self.kafka.consumer({
+              groupId: opts.group,
+              maxInFlightRequests: opts.prefetch,
+            });
             try {
-              body = JSON.parse(message.value?.toString() || '{}');
-            } catch {
-              body = {};
-            }
-            let deliveryCount = body.deliveryCount ?? 1;
-
-            const settle = async () => {
-              tracker!.markSettled(offset);
-              const commitTo = tracker!.contiguousCommitOffset();
-              if (commitTo !== null) {
-                await consumer.commitOffsets([
-                  { topic, partition, offset: String(BigInt(commitTo) + 1n) },
-                ]);
+              await consumer.connect();
+              const topics = opts.queues.map((q) => self.topicForQueue(q));
+              for (const t of topics) {
+                await consumer.subscribe({ topic: t, fromBeginning: true });
               }
-              inFlight--;
-            };
 
-            const delivery: JobDelivery = {
-              id: `${topic}:${partition}:${offset}`,
-              queue: qName,
-              taskName: body.taskName ?? '',
-              payload: body.payload,
-              enqueuedAt: body.enqueuedAt ?? Date.now(),
-              deliveryCount,
-              meta: body.meta ?? {},
-              async ack() {
-                await settle();
-              },
-              async retry({ delayMs, error }) {
-                void error;
-                const delays = self.ctx?.capabilities.delays;
-                if (!delays) throw new Error('kafka retry requires delays capability');
-                await delays.schedule(
-                  {
+              const trackers = new Map<string, ContiguousOffsetTracker>();
+              let inFlight = 0;
+              const pending = new Set<Promise<void>>();
+
+              await consumer.run({
+                autoCommit: false,
+                partitionsConsumedConcurrently: Math.max(1, opts.prefetch),
+                eachMessage: async ({
+                  topic,
+                  partition,
+                  message,
+                }: {
+                  topic: string;
+                  partition: number;
+                  message: KafkaMsg;
+                }) => {
+                  if (!running) return;
+                  while (inFlight >= opts.prefetch) {
+                    await Bun.sleep(5);
+                    if (!running) return;
+                  }
+                  inFlight++;
+                  const key = `${topic}:${partition}`;
+                  let tracker = trackers.get(key);
+                  if (!tracker) {
+                    tracker = new ContiguousOffsetTracker();
+                    trackers.set(key, tracker);
+                  }
+                  const offset = message.offset;
+                  tracker.markUnsettled(offset);
+                  const qName =
+                    opts.queues.find((q) => self.topicForQueue(q) === topic) ??
+                    topic;
+
+                  let body: any = {};
+                  try {
+                    body = JSON.parse(message.value?.toString() || '{}');
+                  } catch {
+                    body = {};
+                  }
+                  const deliveryCount = body.deliveryCount ?? 1;
+                  let settled = false;
+                  const settle = async () => {
+                    if (settled) return;
+                    settled = true;
+                    tracker!.markSettled(offset);
+                    const commitTo = tracker!.contiguousCommitOffset();
+                    if (commitTo !== null) {
+                      await consumer.commitOffsets([
+                        {
+                          topic,
+                          partition,
+                          offset: String(BigInt(commitTo) + 1n),
+                        },
+                      ]);
+                    }
+                    inFlight--;
+                  };
+
+                  const delivery: JobDelivery = {
+                    id: `${topic}:${partition}:${offset}`,
                     queue: qName,
-                    taskName: body.taskName,
+                    taskName: body.taskName ?? '',
                     payload: body.payload,
                     enqueuedAt: body.enqueuedAt ?? Date.now(),
+                    deliveryCount,
                     meta: body.meta ?? {},
-                    deliveryCount: deliveryCount + 1,
-                  },
-                  Date.now() + Math.max(0, delayMs),
-                );
-                await settle();
-              },
-              async deadLetter({ error }) {
-                await self.producer.send({
-                  topic: self.dlqTopic(qName),
-                  acks: -1,
-                  messages: [
-                    {
-                      value: JSON.stringify({
-                        ...body,
-                        error,
-                        originalId: `${topic}:${partition}:${offset}`,
-                        deliveryCount,
-                        deadLetteredAt: Date.now(),
-                      }),
+                    async ack() {
+                      await settle();
                     },
-                  ],
-                });
-                await settle();
-              },
-            };
-            try {
-              await onDelivery(delivery);
-            } catch {
-              inFlight--;
+                    async retry({ delayMs, error }) {
+                      void error;
+                      const delays = self.ctx?.capabilities.delays;
+                      if (!delays)
+                        throw new Error('kafka retry requires delays capability');
+                      await delays.schedule(
+                        {
+                          queue: qName,
+                          taskName: body.taskName,
+                          payload: body.payload,
+                          enqueuedAt: body.enqueuedAt ?? Date.now(),
+                          meta: body.meta ?? {},
+                          deliveryCount: deliveryCount + 1,
+                        },
+                        Date.now() + Math.max(0, delayMs),
+                      );
+                      await settle();
+                    },
+                    async deadLetter({ error }) {
+                      await self.producer.send({
+                        topic: self.dlqTopic(qName),
+                        acks: -1,
+                        messages: [
+                          {
+                            value: JSON.stringify({
+                              ...body,
+                              error,
+                              originalId: `${topic}:${partition}:${offset}`,
+                              deliveryCount,
+                              deadLetteredAt: Date.now(),
+                            }),
+                          },
+                        ],
+                      });
+                      await settle();
+                    },
+                  };
+
+                  const work = (async () => {
+                    try {
+                      await onDelivery(delivery);
+                    } catch {
+                      if (!settled) inFlight--;
+                    }
+                  })();
+                  pending.add(work);
+                  work.finally(() => pending.delete(work));
+                  // Return without awaiting work so prefetch concurrency applies
+                },
+              });
+
+              backoff = 1000;
+              while (running && !self.closed) {
+                await Bun.sleep(200);
+              }
+              await Promise.allSettled([...pending]);
+              await consumer.disconnect().catch(() => {});
+            } catch (err) {
+              try {
+                await consumer.disconnect();
+              } catch {
+                /* ignore */
+              }
+              if (!running || self.closed) break;
+              self.ctx?.logger.warn('kafka consumer disconnected; reconnecting', {
+                error: String(err),
+              });
+              await Bun.sleep(backoff);
+              backoff = Math.min(backoff * 2, 30_000);
             }
-          },
-        });
+          }
+          stopResolve?.();
+        })();
 
         return {
           async stop() {
             running = false;
-            await run.catch(() => {});
-            await consumer.disconnect();
+            await Promise.race([stopped, Bun.sleep(5000)]);
+            await loop.catch(() => {});
           },
         };
       },
@@ -255,7 +327,15 @@ export class KafkaProvider implements BackstageProvider {
         const result = await self.producer.send({
           topic: t,
           acks: -1,
-          messages: [{ value: JSON.stringify({ payload, publishedAt: Date.now() }) }],
+          messages: [
+            {
+              value: JSON.stringify({
+                payload,
+                publishedAt: Date.now(),
+                deliveryCount: 1,
+              }),
+            },
+          ],
         });
         const r0 = result?.[0];
         return r0 ? `${r0.baseOffset}` : `topic-${Date.now()}`;
@@ -264,44 +344,118 @@ export class KafkaProvider implements BackstageProvider {
         opts: TopicSubscribeOptions,
         onMessage: (m: TopicDelivery) => Promise<void>,
       ): Promise<Subscription> {
+        let running = true;
+        let stopResolve: (() => void) | null = null;
+        const stopped = new Promise<void>((r) => {
+          stopResolve = r;
+        });
+        const topic = `${self.prefix}.topic.${opts.topic}`;
         const group = opts.group
           ? `${self.prefix}.grp.${opts.group}`
           : `${self.prefix}.sub.${opts.consumerId}`;
-        const topic = `${self.prefix}.topic.${opts.topic}`;
-        const consumer = self.kafka.consumer({ groupId: group });
-        await consumer.connect();
-        await consumer.subscribe({
-          topic,
-          fromBeginning: opts.from === 'earliest',
-        });
-        let running = true;
-        const run = consumer.run({
-          eachMessage: async ({ message }: { message: KafkaMsg }) => {
-            if (!running) return;
-            const body = JSON.parse(message.value?.toString() || '{}');
-            const delivery: TopicDelivery = {
-              id: message.offset,
-              topic: opts.topic,
-              payload: body.payload,
-              publishedAt: body.publishedAt ?? Date.now(),
-              deliveryCount: 1,
-              async ack() {
-                /* kafkajs auto-commit in this path; fine for topics */
-              },
-            };
+
+        const loop = (async () => {
+          let backoff = 1000;
+          while (running && !self.closed) {
+            const consumer = self.kafka.consumer({ groupId: group });
             try {
-              await onMessage(delivery);
-              await delivery.ack();
-            } catch {
-              /* leave for retry */
+              await consumer.connect();
+              await consumer.subscribe({
+                topic,
+                fromBeginning: opts.from === 'earliest',
+              });
+              await consumer.run({
+                autoCommit: false,
+                eachMessage: async ({
+                  topic: t,
+                  partition,
+                  message,
+                }: {
+                  topic: string;
+                  partition: number;
+                  message: KafkaMsg;
+                }) => {
+                  if (!running) return;
+                  const body = JSON.parse(message.value?.toString() || '{}');
+                  const count = Number(body.deliveryCount ?? 1);
+                  const delivery: TopicDelivery = {
+                    id: message.offset,
+                    topic: opts.topic,
+                    payload: body.payload,
+                    publishedAt: body.publishedAt ?? Date.now(),
+                    deliveryCount: count,
+                    async ack() {
+                      await consumer.commitOffsets([
+                        {
+                          topic: t,
+                          partition,
+                          offset: String(BigInt(message.offset) + 1n),
+                        },
+                      ]);
+                    },
+                  };
+                  try {
+                    await onMessage(delivery);
+                    await delivery.ack();
+                  } catch (err) {
+                    if (count >= self.maxDeliveries) {
+                      self.ctx?.logger.error(
+                        `Topic handler failed after ${count} deliveries; dropping`,
+                        {
+                          topic: opts.topic,
+                          error:
+                            err instanceof Error ? err.message : String(err),
+                        },
+                      );
+                      await delivery.ack();
+                      return;
+                    }
+                    try {
+                      await self.producer.send({
+                        topic,
+                        acks: -1,
+                        messages: [
+                          {
+                            value: JSON.stringify({
+                              payload: body.payload,
+                              publishedAt: body.publishedAt ?? Date.now(),
+                              deliveryCount: count + 1,
+                            }),
+                          },
+                        ],
+                      });
+                      await delivery.ack();
+                    } catch {
+                      // leave uncommitted for redelivery after rebalance
+                    }
+                  }
+                },
+              });
+              backoff = 1000;
+              while (running && !self.closed) {
+                await Bun.sleep(200);
+              }
+              await consumer.disconnect().catch(() => {});
+            } catch (err) {
+              try {
+                await consumer.disconnect();
+              } catch {
+                /* ignore */
+              }
+              if (!running || self.closed) break;
+              await Bun.sleep(backoff);
+              backoff = Math.min(backoff * 2, 30_000);
+              void err;
             }
-          },
-        });
+          }
+          stopResolve?.();
+        })();
+
         return {
           async stop() {
             running = false;
-            await run.catch(() => {});
-            await consumer.disconnect();
+            await Promise.race([stopped, Bun.sleep(5000)]);
+            await loop.catch(() => {});
           },
         };
       },
@@ -326,17 +480,22 @@ export class ContiguousOffsetTracker {
   }
 
   contiguousCommitOffset(): string | null {
-    return this.highestContiguous === null ? null : String(this.highestContiguous);
+    return this.highestContiguous === null
+      ? null
+      : String(this.highestContiguous);
   }
 
   private recompute(): void {
     if (this.settled.size === 0) return;
-    const sorted = [...this.settled].map(BigInt).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    const sorted = [...this.settled]
+      .map(BigInt)
+      .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
     let cursor = this.highestContiguous;
     for (const off of sorted) {
       if (cursor === null) {
-        // start from lowest settled only if nothing unsettled below it
-        const hasLowerUnsettled = [...this.unsettled].some((u) => BigInt(u) < off);
+        const hasLowerUnsettled = [...this.unsettled].some(
+          (u) => BigInt(u) < off,
+        );
         if (hasLowerUnsettled) break;
         cursor = off;
         continue;
@@ -348,7 +507,6 @@ export class ContiguousOffsetTracker {
       }
     }
     this.highestContiguous = cursor;
-    // prune settled below contiguous
     if (cursor !== null) {
       for (const s of [...this.settled]) {
         if (BigInt(s) <= cursor) this.settled.delete(s);

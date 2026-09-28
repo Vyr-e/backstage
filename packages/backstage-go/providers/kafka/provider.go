@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/segmentio/kafka-go"
@@ -13,18 +14,22 @@ import (
 )
 
 type Config struct {
-	Brokers []string
-	Prefix  string
+	Brokers       []string
+	Prefix        string
+	MaxDeliveries int
 }
 
 type Provider struct {
-	name    string
-	brokers []string
-	prefix  string
-	ctx     *backstage.ProviderContext
-	jobs    *jobsCap
-	topics  *topicsCap
-	writer  *kafka.Writer
+	name          string
+	brokers       []string
+	prefix        string
+	maxDeliveries  int
+	ctx           *backstage.ProviderContext
+	jobs          *jobsCap
+	topics        *topicsCap
+	writer        *kafka.Writer
+	closed        atomic.Bool
+	mu            sync.Mutex
 }
 
 func New(cfg Config) *Provider {
@@ -36,7 +41,11 @@ func New(cfg Config) *Provider {
 	if prefix == "" {
 		prefix = "backstage"
 	}
-	p := &Provider{name: "kafka", brokers: brokers, prefix: prefix}
+	maxD := cfg.MaxDeliveries
+	if maxD == 0 {
+		maxD = 5
+	}
+	p := &Provider{name: "kafka", brokers: brokers, prefix: prefix, maxDeliveries: maxD}
 	p.jobs = &jobsCap{p: p}
 	p.topics = &topicsCap{p: p}
 	return p
@@ -50,6 +59,8 @@ func (p *Provider) Dedupe() backstage.Dedupe { return nil }
 
 func (p *Provider) Init(ctx context.Context, pctx backstage.ProviderContext) error {
 	p.ctx = &pctx
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.writer = &kafka.Writer{
 		Addr:         kafka.TCP(p.brokers...),
 		Balancer:     &kafka.LeastBytes{},
@@ -60,14 +71,33 @@ func (p *Provider) Init(ctx context.Context, pctx backstage.ProviderContext) err
 }
 
 func (p *Provider) Close() error {
+	p.closed.Store(true)
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.writer != nil {
-		return p.writer.Close()
+		err := p.writer.Close()
+		p.writer = nil
+		return err
 	}
 	return nil
 }
 
 func (p *Provider) queueTopic(q string) string { return p.prefix + "." + q }
 func (p *Provider) dlqTopic(q string) string   { return p.prefix + "." + q + ".dead-letter" }
+
+func (p *Provider) getWriter() *kafka.Writer {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.writer == nil {
+		p.writer = &kafka.Writer{
+			Addr:         kafka.TCP(p.brokers...),
+			Balancer:     &kafka.LeastBytes{},
+			RequiredAcks: kafka.RequireAll,
+			Async:        false,
+		}
+	}
+	return p.writer
+}
 
 type jobsCap struct{ p *Provider }
 
@@ -114,30 +144,57 @@ func (j *jobsCap) Publish(ctx context.Context, job backstage.OutgoingJob) (strin
 		TaskName: job.TaskName, Payload: payload, EnqueuedAt: job.EnqueuedAt,
 		Meta: job.Meta, DeliveryCount: max(1, job.DeliveryCount),
 	})
-	err := j.p.writer.WriteMessages(ctx, kafka.Message{Topic: j.p.queueTopic(job.Queue), Value: body})
+	err := j.p.getWriter().WriteMessages(ctx, kafka.Message{Topic: j.p.queueTopic(job.Queue), Value: body})
 	return fmt.Sprintf("kafka-%d", job.EnqueuedAt), err
 }
 
 func (j *jobsCap) Consume(ctx context.Context, opts backstage.ConsumeOptions, onDelivery func(context.Context, backstage.JobDelivery) error) (backstage.Subscription, error) {
-	readers := make([]*kafka.Reader, 0, len(opts.Queues))
-	for _, q := range opts.Queues {
-		r := kafka.NewReader(kafka.ReaderConfig{
-			Brokers: j.p.brokers, GroupID: opts.Group, Topic: j.p.queueTopic(q),
-			MinBytes: 1, MaxBytes: 10e6, StartOffset: kafka.FirstOffset,
-		})
-		readers = append(readers, r)
-	}
 	stopCtx, cancel := context.WithCancel(ctx)
+	var running atomic.Bool
+	running.Store(true)
+	prefetch := opts.Prefetch
+	if prefetch <= 0 {
+		prefetch = 1
+	}
 	var wg sync.WaitGroup
-	for i, r := range readers {
+	for _, q := range opts.Queues {
 		wg.Add(1)
-		queue := opts.Queues[i]
-		go func(r *kafka.Reader, queue string) {
+		queue := q
+		go func() {
 			defer wg.Done()
-			trackers := map[int]*contiguousTracker{}
-			for {
-				m, err := r.FetchMessage(stopCtx)
+			j.consumeQueue(stopCtx, &running, queue, opts, prefetch, onDelivery)
+		}()
+	}
+	return &sub{stop: func() {
+		running.Store(false)
+		cancel()
+		wg.Wait()
+	}}, nil
+}
+
+func (j *jobsCap) consumeQueue(ctx context.Context, running *atomic.Bool, queue string, opts backstage.ConsumeOptions, prefetch int, onDelivery func(context.Context, backstage.JobDelivery) error) {
+	backoff := time.Second
+	for running.Load() && !j.p.closed.Load() {
+		r := kafka.NewReader(kafka.ReaderConfig{
+			Brokers: j.p.brokers, GroupID: opts.Group, Topic: j.p.queueTopic(queue),
+			MinBytes: 1, MaxBytes: 10e6, StartOffset: kafka.FirstOffset,
+			MaxWait: 500 * time.Millisecond,
+		})
+		trackers := map[int]*contiguousTracker{}
+		sem := make(chan struct{}, prefetch)
+		var inFlight sync.WaitGroup
+		errCh := make(chan error, 1)
+
+		readDone := make(chan struct{})
+		go func() {
+			defer close(readDone)
+			for running.Load() {
+				m, err := r.FetchMessage(ctx)
 				if err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
 					return
 				}
 				tr := trackers[m.Partition]
@@ -153,17 +210,42 @@ func (j *jobsCap) Consume(ctx context.Context, opts backstage.ConsumeOptions, on
 					r: r, m: m, queue: queue, body: body, count: max(1, body.DeliveryCount),
 					tr: tr, p: j.p,
 				}
-				_ = onDelivery(stopCtx, d)
+				sem <- struct{}{}
+				inFlight.Add(1)
+				go func(delivery backstage.JobDelivery) {
+					defer func() { <-sem; inFlight.Done() }()
+					_ = onDelivery(ctx, delivery)
+				}(d)
 			}
-		}(r, queue)
-	}
-	return &sub{stop: func() {
-		cancel()
-		for _, r := range readers {
+		}()
+
+		select {
+		case <-ctx.Done():
 			_ = r.Close()
+			<-readDone
+			inFlight.Wait()
+			return
+		case err := <-errCh:
+			_ = r.Close()
+			<-readDone
+			inFlight.Wait()
+			if !running.Load() || j.p.closed.Load() {
+				return
+			}
+			if j.p.ctx != nil && j.p.ctx.Logger != nil {
+				j.p.ctx.Logger.Warn("kafka consumer disconnected; reconnecting", "queue", queue, "error", err)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+			continue
 		}
-		wg.Wait()
-	}}, nil
+	}
 }
 
 type kDelivery struct {
@@ -218,7 +300,7 @@ func (d *kDelivery) DeadLetter(ctx context.Context, opts backstage.DeadLetterOpt
 		"taskName": d.body.TaskName, "payload": d.body.Payload, "error": opts.Error,
 		"originalId": d.ID(), "deliveryCount": d.count, "deadLetteredAt": time.Now().UnixMilli(),
 	})
-	if err := d.p.writer.WriteMessages(ctx, kafka.Message{Topic: d.p.dlqTopic(d.queue), Value: payload}); err != nil {
+	if err := d.p.getWriter().WriteMessages(ctx, kafka.Message{Topic: d.p.dlqTopic(d.queue), Value: payload}); err != nil {
 		return err
 	}
 	return d.settle(ctx)
@@ -228,11 +310,28 @@ type topicsCap struct{ p *Provider }
 
 func (t *topicsCap) Name() string { return "kafka" }
 func (t *topicsCap) Publish(ctx context.Context, topic string, payload interface{}) (string, error) {
-	body, _ := json.Marshal(map[string]interface{}{"payload": payload, "publishedAt": time.Now().UnixMilli()})
-	err := t.p.writer.WriteMessages(ctx, kafka.Message{Topic: t.p.prefix + ".topic." + topic, Value: body})
+	body, _ := json.Marshal(map[string]interface{}{"payload": payload, "publishedAt": time.Now().UnixMilli(), "deliveryCount": 1})
+	err := t.p.getWriter().WriteMessages(ctx, kafka.Message{Topic: t.p.prefix + ".topic." + topic, Value: body})
 	return strconv.FormatInt(time.Now().UnixMilli(), 10), err
 }
 func (t *topicsCap) Subscribe(ctx context.Context, opts backstage.TopicSubscribeOptions, onMessage func(context.Context, backstage.TopicDelivery) error) (backstage.Subscription, error) {
+	stopCtx, cancel := context.WithCancel(ctx)
+	var running atomic.Bool
+	running.Store(true)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		t.subscribeLoop(stopCtx, &running, opts, onMessage)
+	}()
+	return &sub{stop: func() {
+		running.Store(false)
+		cancel()
+		wg.Wait()
+	}}, nil
+}
+
+func (t *topicsCap) subscribeLoop(ctx context.Context, running *atomic.Bool, opts backstage.TopicSubscribeOptions, onMessage func(context.Context, backstage.TopicDelivery) error) {
 	group := t.p.prefix + ".sub." + opts.ConsumerID
 	if opts.Group != "" {
 		group = t.p.prefix + ".grp." + opts.Group
@@ -241,39 +340,76 @@ func (t *topicsCap) Subscribe(ctx context.Context, opts backstage.TopicSubscribe
 	if opts.From == backstage.TopicFromEarliest {
 		start = kafka.FirstOffset
 	}
-	r := kafka.NewReader(kafka.ReaderConfig{
-		Brokers: t.p.brokers, GroupID: group, Topic: t.p.prefix + ".topic." + opts.Topic,
-		StartOffset: start, MinBytes: 1, MaxBytes: 10e6,
-	})
-	stopCtx, cancel := context.WithCancel(ctx)
-	go func() {
-		for {
-			m, err := r.ReadMessage(stopCtx)
+	topic := t.p.prefix + ".topic." + opts.Topic
+	backoff := time.Second
+	for running.Load() && !t.p.closed.Load() {
+		r := kafka.NewReader(kafka.ReaderConfig{
+			Brokers: t.p.brokers, GroupID: group, Topic: topic,
+			StartOffset: start, MinBytes: 1, MaxBytes: 10e6, MaxWait: 500 * time.Millisecond,
+		})
+		for running.Load() {
+			m, err := r.FetchMessage(ctx)
 			if err != nil {
-				return
+				_ = r.Close()
+				if !running.Load() || t.p.closed.Load() {
+					return
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(backoff):
+				}
+				if backoff < 30*time.Second {
+					backoff *= 2
+				}
+				break
 			}
+			backoff = time.Second
 			var body map[string]json.RawMessage
 			_ = json.Unmarshal(m.Value, &body)
 			var publishedAt int64
 			_ = json.Unmarshal(body["publishedAt"], &publishedAt)
-			td := &topicDel{id: strconv.FormatInt(m.Offset, 10), topic: opts.Topic, payload: body["payload"], publishedAt: publishedAt}
-			_ = onMessage(stopCtx, td)
+			count := 1
+			if raw, ok := body["deliveryCount"]; ok {
+				_ = json.Unmarshal(raw, &count)
+			}
+			td := &topicDel{id: strconv.FormatInt(m.Offset, 10), topic: opts.Topic, payload: body["payload"], publishedAt: publishedAt, count: count}
+			if err := onMessage(ctx, td); err != nil {
+				if count >= t.p.maxDeliveries {
+					if t.p.ctx != nil && t.p.ctx.Logger != nil {
+						t.p.ctx.Logger.Error("Topic handler failed after max deliveries; dropping",
+							"topic", opts.Topic, "error", err)
+					}
+					_ = r.CommitMessages(ctx, m)
+					continue
+				}
+				next, _ := json.Marshal(map[string]interface{}{
+					"payload": json.RawMessage(body["payload"]), "publishedAt": publishedAt, "deliveryCount": count + 1,
+				})
+				if pubErr := t.p.getWriter().WriteMessages(ctx, kafka.Message{Topic: topic, Value: next}); pubErr != nil {
+					// do not commit — redeliver after reconnect/rebalance
+					continue
+				}
+				_ = r.CommitMessages(ctx, m)
+				continue
+			}
+			_ = r.CommitMessages(ctx, m)
 		}
-	}()
-	return &sub{stop: func() { cancel(); _ = r.Close() }}, nil
+	}
 }
 
 type topicDel struct {
 	id, topic   string
 	payload     json.RawMessage
 	publishedAt int64
+	count       int
 }
 
 func (t *topicDel) ID() string                       { return t.id }
 func (t *topicDel) Topic() string                    { return t.topic }
 func (t *topicDel) Payload() json.RawMessage         { return t.payload }
 func (t *topicDel) PublishedAt() int64               { return t.publishedAt }
-func (t *topicDel) DeliveryCount() int               { return 1 }
+func (t *topicDel) DeliveryCount() int               { return t.count }
 func (t *topicDel) Ack(ctx context.Context) error    { return nil }
 
 type sub struct{ stop func() }
@@ -305,7 +441,6 @@ func (t *contiguousTracker) markSettled(off int64) {
 	for {
 		next := t.highest + 1
 		if t.highest < 0 {
-			// find min settled with no lower unsettled
 			minS := int64(-1)
 			for s := range t.settled {
 				if minS < 0 || s < minS {
