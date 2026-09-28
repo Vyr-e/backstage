@@ -1,298 +1,83 @@
-/**
- * Backstage SDK - Stream Abstraction
- */
-
-import {
-  Priority,
-  STREAM_PREFIX,
-  type RedisClient,
-  type StreamMessageData,
-  type EnqueueOptions,
-} from './types';
+import { Priority, type RedisClient, type EnqueueOptions } from './types';
 import { Queue } from './queue';
-
-/**
- * Lua script for atomic scheduled task processing.
- * Prevents race conditions when multiple schedulers are running.
- *
- * KEYS[1]: Scheduled ZSET key
- * ARGV[1]: Current timestamp (cutoff)
- * ARGV[2]: Stream key prefix
- * ARGV[3]: Default priority name
- */
-const PROCESS_SCHEDULED_LUA = `
-local zsetKey = KEYS[1]
-local cutoff = tonumber(ARGV[1])
-local prefix = ARGV[2]
-local defaultPriority = ARGV[3]
-
-local tasks = redis.call('ZRANGEBYSCORE', zsetKey, '-inf', cutoff)
-local processed = 0
-
-for _, taskData in ipairs(tasks) do
-    local ok, task = pcall(cjson.decode, taskData)
-    if ok and task then
-        local streamKey = task.streamKey or (prefix .. ':' .. (task.priority or defaultPriority))
-        
-        local args = {streamKey, '*', 'taskName', task.taskName or '', 'payload', task.payload or '{}', 'enqueuedAt', tostring(task.enqueuedAt or 0)}
-        
-        if task.attempts then
-            table.insert(args, 'attempts')
-            table.insert(args, tostring(task.attempts))
-        end
-        if task.backoff then
-            table.insert(args, 'backoff')
-            table.insert(args, task.backoff)
-        end
-        if task.timeout then
-            table.insert(args, 'timeout')
-            table.insert(args, tostring(task.timeout))
-        end
-        
-        redis.call('XADD', unpack(args))
-        redis.call('ZREM', zsetKey, taskData)
-        processed = processed + 1
-    end
-end
-
-return processed
-`;
+import { RedisStreamsProvider } from './provider/redis';
+import { wireStreamKey } from './wire';
 
 export interface StreamConfig {
   prefix?: string;
   defaultPriority?: Priority;
-  /** Queues to subscribe to. If provided, these REPLACE the default priority queues (urgent, default, low). */
+  /** Queues to subscribe to. If provided, these REPLACE the default priority queues. */
   queues?: Queue[];
 }
 
 /**
- * Manages Redis Stream interactions for task enqueueing and processing.
- * Handles priority queues, scheduled tasks, and consumer groups.
+ * Redis Streams façade kept for back-compat.
+ * New code should prefer RedisStreamsProvider / Worker({ provider }).
  */
 export class Stream {
-  private redis: RedisClient;
-  private consumerGroup: string;
-  private prefix: string;
+  private provider: RedisStreamsProvider;
   private defaultPriority: Priority;
-  private customQueues: Queue[];
+  /** @internal exposed for existing tests */
+  customQueues: Queue[];
 
-  /**
-   * Create a new Stream instance.
-   *
-   * @param redis - Redis client instance
-   * @param consumerGroup - Name of the consumer group for this worker
-   * @param config - Stream configuration options
-   */
   constructor(
     redis: RedisClient,
     consumerGroup: string,
     config: StreamConfig = {},
   ) {
-    this.redis = redis;
-    this.consumerGroup = consumerGroup;
-    this.prefix = config.prefix ?? STREAM_PREFIX;
     this.defaultPriority = config.defaultPriority ?? Priority.DEFAULT;
     this.customQueues = config.queues ? [...config.queues] : [];
+    this.provider = new RedisStreamsProvider({
+      redis,
+      consumerGroup,
+      prefix: config.prefix,
+      defaultPriority: this.defaultPriority,
+    });
   }
 
-  /**
-   * Initialize consumer groups for all queues.
-   * Creates the streams if they don't exist.
-   * If custom queues are configured, only those are initialized (defaults are skipped).
-   *
-   * @returns Promise that resolves when initialization is complete
-   */
   async initialize(): Promise<void> {
-    if (this.customQueues.length > 0) {
-      // Custom queues replace defaults entirely
-      for (const queue of this.customQueues) {
-        await this.createConsumerGroup(queue.streamKey);
-      }
-    } else {
-      // No custom queues — use default priority queues
-      const priorities = [Priority.URGENT, Priority.DEFAULT, Priority.LOW];
-      for (const priority of priorities) {
-        const streamKey = `${this.prefix}:${priority}`;
-        await this.createConsumerGroup(streamKey);
-      }
-    }
+    await this.provider.ensureQueues(this.getQueueNames());
   }
 
-  private async createConsumerGroup(streamKey: string): Promise<void> {
-    try {
-      await this.redis.send('XGROUP', [
-        'CREATE',
-        streamKey,
-        this.consumerGroup,
-        '0',
-        'MKSTREAM',
-      ]);
-    } catch (err: unknown) {
-      if (err instanceof Error && !err.message.includes('BUSYGROUP')) {
-        throw err;
-      }
-    }
-  }
-
-  /**
-   * Enqueue a task for processing.
-   * Supports immediate execution, delayed scheduling, and deduplication.
-   *
-   * @param taskName - Name of the task to execute
-   * @param payload - Data payload for the task
-   * @param options - Queue options (priority, delay, dedupe, etc.)
-   * @returns The Redis Stream message ID, or null if deduplicated
-   *
-   * @example
-   * ```typescript
-   * await stream.enqueue('send-email', { userId: '123' }, { priority: Priority.URGENT });
-   * ```
-   */
   async enqueue(
     taskName: string,
     payload: unknown,
     options: EnqueueOptions = {},
   ): Promise<string | null> {
-    // Handle deduplication
-    if (options.dedupe) {
-      const dedupeKey = `${this.prefix}:dedupe:${options.dedupe.key}`;
-      const ttlSeconds = Math.ceil((options.dedupe.ttl ?? 3600000) / 1000);
-      const set = await this.redis.send('SET', [
-        dedupeKey,
-        '1',
-        'NX',
-        'EX',
-        String(ttlSeconds),
-      ]);
-      if (!set) {
-        return null; // Duplicate, skip
-      }
-    }
-
-    // Determine stream key
-    let streamKey: string;
-    if (options.queue) {
-      // Custom queue name provided
-      streamKey = `${this.prefix}:${options.queue}`;
-    } else {
-      // Use priority (default or specified)
-      const priority = options.priority ?? this.defaultPriority;
-      streamKey = `${this.prefix}:${priority}`;
-    }
-
-    const messageData: StreamMessageData = {
-      taskName,
-      payload: JSON.stringify(payload),
-      enqueuedAt: Date.now(),
-    };
-
-    const delay = options.delay;
-
-    if (delay && delay > 0) {
-      const executeAt = Date.now() + delay;
-      const scheduledKey = `${this.prefix}:scheduled`;
-      const data = JSON.stringify({
-        ...messageData,
-        streamKey, // Store the target stream key
-        priority: options.priority ?? this.defaultPriority,
-        attempts: options.attempts,
-        backoff: options.backoff ? JSON.stringify(options.backoff) : undefined,
-        timeout: options.timeout,
-      });
-
-      await this.redis.send('ZADD', [scheduledKey, String(executeAt), data]);
-      return `scheduled:${executeAt}`;
-    }
-
-    // Build XADD arguments with optional job metadata
-    const xaddArgs: string[] = [
-      streamKey,
-      '*',
-      'taskName',
-      messageData.taskName,
-      'payload',
-      messageData.payload,
-      'enqueuedAt',
-      String(messageData.enqueuedAt),
-    ];
-
-    // Add optional job metadata
-    if (options.attempts !== undefined) {
-      xaddArgs.push('attempts', String(options.attempts));
-    }
-    if (options.backoff) {
-      xaddArgs.push('backoff', JSON.stringify(options.backoff));
-    }
-    if (options.timeout !== undefined) {
-      xaddArgs.push('timeout', String(options.timeout));
-    }
-
-    const messageId = await this.redis.send('XADD', xaddArgs);
-    return messageId as string;
+    return this.provider.publish(taskName, payload, options);
   }
 
-  /**
-   * Process scheduled tasks atomically using Lua script.
-   * Moves tasks from the scheduled ZSET to their respective streams when due.
-   * Safe for multiple scheduler instances to run concurrently.
-   *
-   * @returns Number of tasks processed and moved to streams
-   */
   async processScheduledTasks(): Promise<number> {
-    const scheduledKey = `${this.prefix}:scheduled`;
-    const now = Date.now();
-
-    const result = await this.redis.send('EVAL', [
-      PROCESS_SCHEDULED_LUA,
-      '1',
-      scheduledKey,
-      String(now),
-      this.prefix,
-      this.defaultPriority,
-    ]);
-
-    return (result as number) ?? 0;
+    return this.provider.promoteDueScheduled();
   }
 
-  /**
-   * Get all stream keys in priority order.
-   * If custom queues are configured, only those are returned (sorted by priority).
-   * Otherwise, default queues are returned in order (URGENT -> DEFAULT -> LOW).
-   *
-   * @returns Array of Redis stream keys
-   */
   getStreamKeys(): string[] {
+    return this.getQueueNames().map((q) => wireStreamKey(q));
+  }
+
+  getQueueNames(): string[] {
     if (this.customQueues.length > 0) {
-      // Custom queues replace defaults — sort by priority (lower = higher priority)
       const sorted = [...this.customQueues].sort(
         (a, b) => a.priority - b.priority,
       );
-      return sorted.map((q) => q.streamKey);
+      return sorted.map((q) => q.name);
     }
-
-    // No custom queues — use default priority queues
-    return [
-      `${this.prefix}:${Priority.URGENT}`,
-      `${this.prefix}:${Priority.DEFAULT}`,
-      `${this.prefix}:${Priority.LOW}`,
-    ];
+    return [Priority.URGENT, Priority.DEFAULT, Priority.LOW];
   }
 
   getPrefix(): string {
-    return this.prefix;
+    return 'backstage';
   }
 
-  /**
-   * Add a custom queue at runtime.
-   * Creates the consumer group for the new queue.
-   *
-   * @param queue - The Queue instance to add
-   */
+  getProvider(): RedisStreamsProvider {
+    return this.provider;
+  }
+
   async addQueue(queue: Queue): Promise<void> {
     if (this.customQueues.some((q) => q.name === queue.name)) {
       return;
     }
-    await this.createConsumerGroup(queue.streamKey);
+    await this.provider.ensureQueues([queue.name]);
     this.customQueues.push(queue);
   }
 }

@@ -1,71 +1,46 @@
-/**
- * Backstage SDK - Broadcast
- */
-
-import {
-  BROADCAST_STREAM,
-  type StreamMessage,
-  type RedisClient,
-  parseFields,
-} from './types';
+import type { StreamMessage, RedisClient } from './types';
 import { Logger, createLogger, LogLevel, type LoggerConfig } from './logger';
 import type { Worker } from './worker';
+import type { BackstageProvider } from './provider/types';
+import { RedisStreamsProvider } from './provider/redis';
 
 export interface BroadcastConfig {
-  /** Worker instance to extract redis and workerId from */
   worker?: Worker;
-  /** Redis client (required if worker not provided) */
+  provider?: BackstageProvider;
   redis?: RedisClient;
-  /** Worker ID (required if worker not provided) */
   workerId?: string;
-  /** Idle threshold for consumer cleanup in milliseconds (default: 1 hour) */
   consumerIdleThreshold?: number;
-  /** Where a newly created consumer group starts (default: latest) */
   startPosition?: 'latest' | 'beginning';
-  /** Logger configuration */
   loggerConfig?: LoggerConfig;
 }
 
 /**
- * Handles broadcasting messages to all active workers.
- * Uses a dedicated broadcast stream with per-worker consumer groups.
- *
- * @example
- * ```typescript
- * const broadcast = new Broadcast({ worker });
- * await broadcast.initialize();
- * await broadcast.send('config-update', { version: 2 });
- * ```
+ * Thin façade over BackstageProvider broadcast methods.
  */
 export class Broadcast {
-  private redis: RedisClient;
+  private provider: BackstageProvider;
   private workerId: string;
-  private consumerGroup: string;
   private logger: Logger;
   private consumerIdleThreshold: number;
   private startPosition: 'latest' | 'beginning';
 
-  /**
-   * Create a new Broadcast instance.
-   *
-   * @param config - Configuration options
-   */
   constructor(config: BroadcastConfig) {
-    // Extract redis and workerId from worker or use provided values
     if (config.worker) {
-      this.redis = config.worker.redis;
+      this.provider = config.worker.provider;
       this.workerId = config.worker.workerId;
+    } else if (config.provider && config.workerId) {
+      this.provider = config.provider;
+      this.workerId = config.workerId;
     } else if (config.redis && config.workerId) {
-      this.redis = config.redis;
+      this.provider = new RedisStreamsProvider({ redis: config.redis });
       this.workerId = config.workerId;
     } else {
       throw new Error(
-        'Broadcast requires either a worker instance or both redis and workerId',
+        'Broadcast requires a worker, a provider+workerId, or redis+workerId',
       );
     }
 
-    this.consumerGroup = `broadcast-${this.workerId}`;
-    this.consumerIdleThreshold = config.consumerIdleThreshold ?? 60 * 60 * 1000; // 1 hour
+    this.consumerIdleThreshold = config.consumerIdleThreshold ?? 60 * 60 * 1000;
     this.startPosition = config.startPosition ?? 'latest';
     this.logger = createLogger({
       level: LogLevel.INFO,
@@ -73,226 +48,42 @@ export class Broadcast {
     });
   }
 
-  /**
-   * Initialize the broadcast system.
-   * Creates a unique consumer group for this worker on the broadcast stream.
-   *
-   * @returns Promise that resolves when initialized
-   */
   async initialize(): Promise<void> {
-    try {
-      await this.redis.send('XGROUP', [
-        'CREATE',
-        BROADCAST_STREAM,
-        this.consumerGroup,
-        this.startPosition === 'beginning' ? '0' : '$',
-        'MKSTREAM',
-      ]);
-      this.logger.debug(`Created consumer group: ${this.consumerGroup}`);
-    } catch (err: unknown) {
-      if (err instanceof Error && !err.message.includes('BUSYGROUP')) {
-        throw err;
-      }
-    }
+    await this.provider.ensureBroadcast(this.workerId, this.startPosition);
+    this.logger.debug(`Broadcast ready for worker: ${this.workerId}`);
   }
 
-  /**
-   * Send a broadcast message to all listening workers.
-   *
-   * @param taskName - Name of the broadcast task
-   * @param payload - Data payload
-   * @returns The message ID
-   */
   async send(taskName: string, payload: unknown): Promise<string> {
-    const messageId = await this.redis.send('XADD', [
-      BROADCAST_STREAM,
-      '*',
-      'taskName',
-      taskName,
-      'payload',
-      JSON.stringify(payload),
-      'enqueuedAt',
-      String(Date.now()),
-    ]);
-
-    return messageId as string;
+    return this.provider.broadcast(taskName, payload);
   }
 
-  /**
-   * Read new broadcast messages for this worker.
-   *
-   * @param blockMs - Milliseconds to block if no messages available (default 0)
-   * @returns Array of stream messages
-   */
   async read(blockMs: number = 0): Promise<StreamMessage[]> {
-    const messages: StreamMessage[] = [];
-
-    try {
-      const result = await this.redis.send('XREADGROUP', [
-        'GROUP',
-        this.consumerGroup,
-        this.workerId,
-        'COUNT',
-        '10',
-        'BLOCK',
-        String(blockMs),
-        'STREAMS',
-        BROADCAST_STREAM,
-        '>',
-      ]);
-
-      // Bun's Redis client returns results in object format:
-      //   {streamKey: [[msgId, fields], ...]}
-      // Standard Redis returns:
-      //   [[streamKey, [[msgId, fields], ...]]]
-      // Handle both formats so broadcasts behave the same as the worker loop.
-      if (!result || typeof result !== 'object') {
-        return messages;
-      }
-
-      const entries = Array.isArray(result)
-        ? (result as [string, unknown[]][])
-        : (Object.entries(result) as [string, unknown[]][]);
-
-      for (const [, streamMessages] of entries) {
-        if (!Array.isArray(streamMessages)) continue;
-
-        for (const msgEntry of streamMessages) {
-          if (!Array.isArray(msgEntry) || msgEntry.length < 2) continue;
-
-          const [msgId, fields] = msgEntry as [string, unknown[]];
-          const message = this.parseMessage(msgId, fields);
-          if (message) {
-            messages.push(message);
-          }
-        }
-      }
-    } catch {
-      // Skip read errors
-    }
-
-    return messages;
+    const messages = await this.provider.consumeBroadcast({
+      consumerIdentity: this.workerId,
+      maxMessages: 10,
+      blockMs,
+    });
+    return messages.map((m) => ({
+      id: m.id,
+      taskName: m.taskName,
+      payload: m.payload,
+      deliveryCount: m.deliveryCount,
+      enqueuedAt: m.enqueuedAt,
+    }));
   }
 
-  /**
-   * Acknowledge a broadcast message.
-   * This marks it as processed for this worker's consumer group.
-   *
-   * @param messageId - ID of the message to acknowledge
-   */
   async ack(messageId: string): Promise<void> {
-    await this.redis.send('XACK', [
-      BROADCAST_STREAM,
-      this.consumerGroup,
-      messageId,
-    ]);
+    await this.provider.ackBroadcast(this.workerId, [messageId]);
   }
 
-  private parseMessage(id: string, fields: unknown[]): StreamMessage | null {
-    try {
-      const data = parseFields(fields);
-
-      return {
-        id,
-        taskName: data.taskName || '',
-        payload: JSON.parse(data.payload || 'null'),
-        deliveryCount: 1,
-        enqueuedAt: parseInt(data.enqueuedAt || '0', 10) || Date.now(),
-      };
-    } catch {
-      return null;
-    }
-  }
-
-  /**
-   * Clean up ghost consumer groups from terminated workers.
-   * Checks consumer idle time to identify stale groups.
-   *
-   * @returns Number of deleted consumer groups
-   */
   async cleanup(): Promise<number> {
-    let deleted = 0;
-
-    try {
-      const groups = await this.redis.send('XINFO', [
-        'GROUPS',
-        BROADCAST_STREAM,
-      ]);
-      if (!groups || !Array.isArray(groups)) return deleted;
-
-      for (const group of groups) {
-        const info = this.parseRedisInfo(group);
-        const groupName = info.name as string;
-
-        // Never delete our own group
-        if (groupName === this.consumerGroup) continue;
-
-        // Check if all consumers in this group are idle (ghosts)
-        const shouldDelete = await this.isGroupIdle(groupName);
-        if (shouldDelete) {
-          await this.redis.send('XGROUP', [
-            'DESTROY',
-            BROADCAST_STREAM,
-            groupName,
-          ]);
-          this.logger.info(`Deleted stale consumer group: ${groupName}`);
-          deleted++;
-        }
-      }
-    } catch {
-      // Skip cleanup errors
+    if (!this.provider.cleanupBroadcastGhosts) return 0;
+    const deleted = await this.provider.cleanupBroadcastGhosts(
+      this.consumerIdleThreshold,
+    );
+    if (deleted > 0) {
+      this.logger.info(`Deleted ${deleted} stale broadcast consumer groups`);
     }
-
     return deleted;
-  }
-
-  /**
-   * Check if all consumers in a group are idle (ghosts).
-   */
-  private async isGroupIdle(groupName: string): Promise<boolean> {
-    try {
-      const consumers = await this.redis.send('XINFO', [
-        'CONSUMERS',
-        BROADCAST_STREAM,
-        groupName,
-      ]);
-
-      if (!consumers || !Array.isArray(consumers) || consumers.length === 0) {
-        // No consumers = definitely stale
-        return true;
-      }
-
-      for (const consumer of consumers) {
-        const info = this.parseRedisInfo(consumer);
-        const idle = (info.idle as number) ?? 0;
-
-        // If any consumer is active (not idle beyond threshold), don't delete
-        if (idle < this.consumerIdleThreshold) {
-          return false;
-        }
-      }
-
-      // All consumers are ghosts (idle beyond threshold)
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * Parse Redis XINFO key-value array into object.
-   */
-  private parseRedisInfo(data: unknown): Record<string, unknown> {
-    const info: Record<string, unknown> = {};
-    if (Array.isArray(data)) {
-      for (let i = 0; i < data.length; i += 2) {
-        const key = data[i];
-        const value = data[i + 1];
-        if (typeof key === 'string') {
-          info[key] = value;
-        }
-      }
-    }
-    return info;
   }
 }

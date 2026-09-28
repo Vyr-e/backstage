@@ -7,3 +7,8 @@ export type {
   ReclaimIdleArgs,
   DeadLetterMeta,
 } from './types';
+
+export {
+  RedisStreamsProvider,
+  type RedisStreamsProviderConfig,
+} from './redis';

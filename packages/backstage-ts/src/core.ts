@@ -91,6 +91,10 @@ export type {
   DeadLetterMeta,
 } from './provider';
 export {
+  RedisStreamsProvider,
+  type RedisStreamsProviderConfig,
+} from './provider';
+export {
   WIRE_PREFIX,
   WIRE_DEFAULT_CONSUMER_GROUP,
   WIRE_SCHEDULED_KEY,
