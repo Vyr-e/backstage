@@ -44,7 +44,8 @@ describe('Worker Timeouts', () => {
       { hardTimeout: 50 },
     );
 
-    await worker.start();
+    void worker.start();
+    await Bun.sleep(50);
     const start = performance.now();
     await worker.enqueue('slow.task', {});
 
@@ -88,7 +89,8 @@ describe('Worker Timeouts', () => {
       { hardTimeout: 5000 },
     );
 
-    await worker.start();
+    void worker.start();
+    await Bun.sleep(50);
     await worker.enqueue('slow.task', {}, { timeout: 40 });
 
     const deadline = Date.now() + 3000;

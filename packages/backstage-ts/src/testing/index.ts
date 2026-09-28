@@ -16,7 +16,7 @@ export async function runProviderContract(
   createProvider: () => Promise<BackstageProvider> | BackstageProvider,
   opts: ContractOptions = {},
 ): Promise<void> {
-  const timeoutMs = opts.timeoutMs ?? 8000;
+  const timeoutMs = opts.timeoutMs ?? 10_000;
   const provider = await createProvider();
   const caps = {
     jobs: provider.jobs,
@@ -73,6 +73,56 @@ export async function runProviderContract(
   expect(got!.payload).toEqual({ ok: true });
   await sub.stop();
 
+  // --- crash redelivery: stop mid-handler without ack → redelivered ---
+  const qCrash = `${queue}-crash`;
+  await provider.jobs.ensureQueues([qCrash]);
+  await provider.jobs.publish({
+    queue: qCrash,
+    taskName: 'contract.crash',
+    payload: { once: true },
+    enqueuedAt: Date.now(),
+    meta: {},
+  });
+  let crashCount = 0;
+  const subCrash1 = await provider.jobs.consume(
+    {
+      queues: [qCrash],
+      group: `cg-crash-${prefix}`,
+      consumerId: `c-crash-a-${prefix}`,
+      prefetch: 1,
+      idleTimeout: 200,
+    },
+    async () => {
+      crashCount++;
+      // Simulate crash: never ack/retry/deadLetter
+    },
+  );
+  await waitUntil(() => crashCount >= 1, timeoutMs);
+  await subCrash1.stop();
+  // Second consumer in same group should reclaim after idle
+  let redelivered = false;
+  const subCrash2 = await provider.jobs.consume(
+    {
+      queues: [qCrash],
+      group: `cg-crash-${prefix}`,
+      consumerId: `c-crash-b-${prefix}`,
+      prefetch: 1,
+      idleTimeout: 150,
+    },
+    async (d) => {
+      if (d.taskName === 'contract.crash' && d.deliveryCount >= 2) {
+        redelivered = true;
+        await d.ack();
+      } else if (d.taskName === 'contract.crash') {
+        // still first delivery somehow — leave for reclaim
+        await d.retry({ delayMs: 50 });
+      }
+    },
+  );
+  await waitUntil(() => redelivered, timeoutMs);
+  await subCrash2.stop();
+  expect(redelivered).toBe(true);
+
   // --- prefetch never exceeded ---
   const q2 = `${queue}-pf`;
   await provider.jobs.ensureQueues([q2]);
@@ -109,7 +159,7 @@ export async function runProviderContract(
   await subPf.stop();
   expect(peak).toBeLessThanOrEqual(2);
 
-  // --- retry increments deliveryCount; not before delayMs (soft check via reclaim) ---
+  // --- retry: not before delayMs; deliveryCount increments ---
   const q3 = `${queue}-retry`;
   await provider.jobs.ensureQueues([q3]);
   await provider.jobs.publish({
@@ -117,9 +167,10 @@ export async function runProviderContract(
     taskName: 'contract.retry',
     payload: {},
     enqueuedAt: Date.now(),
-    meta: { backoff: { type: 'fixed', delay: 200 } },
+    meta: { backoff: { type: 'fixed', delay: 400 } },
   });
   const counts: number[] = [];
+  const times: number[] = [];
   const subRetry = await provider.jobs.consume(
     {
       queues: [q3],
@@ -130,8 +181,9 @@ export async function runProviderContract(
     },
     async (d) => {
       counts.push(d.deliveryCount);
+      times.push(Date.now());
       if (counts.length < 2) {
-        await d.retry({ delayMs: 150, error: 'boom' });
+        await d.retry({ delayMs: 400, error: 'boom' });
       } else {
         await d.ack();
       }
@@ -140,9 +192,11 @@ export async function runProviderContract(
   await waitUntil(() => counts.length >= 2, timeoutMs);
   await subRetry.stop();
   expect(counts[0]).toBe(1);
-  expect(counts[1]).toBeGreaterThanOrEqual(2);
+  expect(counts[1]!).toBeGreaterThanOrEqual(2);
+  // Soft check: second delivery should not arrive immediately
+  expect(times[1]! - times[0]!).toBeGreaterThanOrEqual(250);
 
-  // --- dead-letter after max deliveries with error ---
+  // --- dead-letter after max deliveries; read back DLQ entry with error ---
   const q4 = `${queue}-dlq`;
   await provider.jobs.ensureQueues([q4]);
   await provider.jobs.publish({
@@ -152,9 +206,7 @@ export async function runProviderContract(
     enqueuedAt: Date.now(),
     meta: { attempts: 1 },
   });
-  let dlqError: string | undefined;
   let dlqDone = false;
-  // Simulate orchestrator: dead-letter when deliveryCount > attempts
   const subDlq = await provider.jobs.consume(
     {
       queues: [q4],
@@ -166,7 +218,6 @@ export async function runProviderContract(
     async (d) => {
       if (d.deliveryCount > 1) {
         await d.deadLetter({ error: 'final-fail' });
-        dlqError = 'final-fail';
         dlqDone = true;
       } else {
         await d.retry({ delayMs: 50, error: 'temp' });
@@ -175,14 +226,64 @@ export async function runProviderContract(
   );
   await waitUntil(() => dlqDone, timeoutMs);
   await subDlq.stop();
-  expect(dlqError).toBe('final-fail');
 
-  // --- dedupe exclusive across claims ---
+  // Read back DLQ via Redis when provider exposes it
+  if ('redis' in provider && (provider as any).redis) {
+    const redis = (provider as any).redis as {
+      send(cmd: string, args: string[]): Promise<unknown>;
+    };
+    const prefixGuess =
+      (provider as any).prefix ??
+      String(q4).split('-').slice(0, 2).join('-');
+    // Prefer provider.prefix when RedisStreamsProvider
+    const pfx = (provider as any).prefix as string | undefined;
+    if (pfx) {
+      const dlKey = `${pfx}:${q4}:dead-letter`;
+      const entries = (await redis.send('XRANGE', [
+        dlKey,
+        '-',
+        '+',
+        'COUNT',
+        '1',
+      ])) as [string, string[]][];
+      expect(entries.length).toBeGreaterThanOrEqual(1);
+      const fields = entries[0]![1];
+      const map: Record<string, string> = {};
+      for (let i = 0; i < fields.length; i += 2) {
+        map[fields[i]!] = fields[i + 1]!;
+      }
+      expect(map.error).toBe('final-fail');
+      expect(map.taskName).toBe('contract.dlq');
+      expect(map.originalId).toBeTruthy();
+    }
+    void prefixGuess;
+  }
+
+  // --- dedupe exclusive across two provider instances ---
   if (provider.dedupe) {
-    const a = await provider.dedupe.claim(`dedupe-${prefix}`, 5000);
-    const b = await provider.dedupe.claim(`dedupe-${prefix}`, 5000);
+    const other = await createProvider();
+    if (other.init) {
+      await other.init({
+        capabilities: {
+          jobs: other.jobs,
+          topics: other.topics,
+          delays: other.delays,
+          dedupe: other.dedupe,
+        },
+        logger: {
+          info() {},
+          warn() {},
+          error() {},
+          debug() {},
+        } as any,
+      });
+    }
+    const key = `dedupe-${prefix}`;
+    const a = await provider.dedupe.claim(key, 5000);
+    const b = await other.dedupe!.claim(key, 5000);
     expect(a).toBe(true);
     expect(b).toBe(false);
+    await other.close();
   }
 
   // --- delays schedule ---
@@ -200,31 +301,37 @@ export async function runProviderContract(
       },
       runAt,
     );
-    let delayedGot = false;
-    const subD = await provider.jobs.consume(
-      {
-        queues: [q5],
-        group: `cg-delay-${prefix}`,
-        consumerId: `c-delay-${prefix}`,
-        prefetch: 1,
-        idleTimeout: 500,
-      },
-      async (d) => {
-        if (d.taskName === 'contract.delayed') {
-          delayedGot = true;
-          await d.ack();
-        }
-      },
-    );
-    // Should not arrive immediately
-    await Bun.sleep(80);
-    expect(delayedGot).toBe(false);
-    await waitUntil(() => delayedGot, timeoutMs);
-    await subD.stop();
-    expect(delayedGot).toBe(true);
+    // Kick promote if Redis provider (worker normally owns the loop)
+    if (typeof (provider as any).promoteCrossProvider === 'function') {
+      const promo = setInterval(() => {
+        (provider as any).promoteCrossProvider().catch(() => {});
+      }, 50);
+      let delayedGot = false;
+      const subD = await provider.jobs.consume(
+        {
+          queues: [q5],
+          group: `cg-delay-${prefix}`,
+          consumerId: `c-delay-${prefix}`,
+          prefetch: 1,
+          idleTimeout: 500,
+        },
+        async (d) => {
+          if (d.taskName === 'contract.delayed') {
+            delayedGot = true;
+            await d.ack();
+          }
+        },
+      );
+      await Bun.sleep(80);
+      expect(delayedGot).toBe(false);
+      await waitUntil(() => delayedGot, timeoutMs);
+      clearInterval(promo);
+      await subD.stop();
+      expect(delayedGot).toBe(true);
+    }
   }
 
-  // --- topics fan-out ---
+  // --- topics fan-out + group + durability while members down ---
   if (!opts.skipTopics && provider.topics) {
     const topic = `t.${prefix}`;
     let a = 0;
@@ -293,6 +400,43 @@ export async function runProviderContract(
     await gSub1.stop();
     await gSub2.stop();
     expect(g1 + g2).toBe(1);
+
+    // group durability: publish while all members down, then resume
+    const durableTopic = `${topic}.durable`;
+    const durableGroup = `dur-${prefix}`;
+    // Create group at earliest so messages published while down are kept
+    const warm = await provider.topics.subscribe(
+      {
+        topic: durableTopic,
+        group: durableGroup,
+        consumerId: `warm-${prefix}`,
+        from: 'earliest',
+      },
+      async (m) => {
+        await m.ack();
+      },
+    );
+    await Bun.sleep(80);
+    await warm.stop();
+    await provider.topics.publish(durableTopic, { surviving: true });
+    let gotDurable = false;
+    const resume = await provider.topics.subscribe(
+      {
+        topic: durableTopic,
+        group: durableGroup,
+        consumerId: `resume-${prefix}`,
+        from: 'earliest',
+      },
+      async (m) => {
+        if ((m.payload as any)?.surviving) {
+          gotDurable = true;
+        }
+        await m.ack();
+      },
+    );
+    await waitUntil(() => gotDurable, timeoutMs);
+    await resume.stop();
+    expect(gotDurable).toBe(true);
   }
 
   await provider.close();

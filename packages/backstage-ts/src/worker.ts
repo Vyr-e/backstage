@@ -70,6 +70,8 @@ export class Worker {
   private pendingTopicSubs: PendingTopicSub[] = [];
   private promoteTimer: Timer | null = null;
   private providerReady: Promise<void>;
+  private stopResolve: (() => void) | null = null;
+  private startDone: Promise<void> | null = null;
 
   get redis(): RedisClient {
     if (!this.redisProvider) {
@@ -120,6 +122,7 @@ export class Worker {
         deleteOnAck: this.config.deleteOnAck,
         blockTimeout: this.config.blockTimeout,
         reclaimIntervalMs: this.config.reclaimerInterval,
+        maxDeliveries: this.config.maxDeliveries,
       });
       this.provider = redisProvider;
       this.redisProvider = redisProvider;
@@ -201,8 +204,7 @@ export class Worker {
       if (!claimed) return null;
     }
 
-    const queue =
-      options.queue ?? options.priority ?? Priority.DEFAULT;
+    const queue = options.queue ?? options.priority ?? Priority.DEFAULT;
     const job = {
       queue,
       taskName,
@@ -268,10 +270,13 @@ export class Worker {
     return this;
   }
 
+  /**
+   * Start the worker. Blocks until stop() is called (master behavior).
+   * A second concurrent start() throws.
+   */
   async start(): Promise<void> {
     if (this.running) {
-      this.logger.warn('Worker is already running');
-      return;
+      throw new Error('Worker is already running');
     }
 
     await this.providerReady;
@@ -305,6 +310,7 @@ export class Worker {
       await this.startTopicSub(sub);
     }
 
+    // One promote loop in the worker only (not in producers / provider.schedule)
     if (this.resolved.delays && this.redisProvider) {
       this.promoteTimer = setInterval(() => {
         this.redisProvider!.promoteCrossProvider().catch(() => {});
@@ -313,6 +319,11 @@ export class Worker {
 
     this.setupSignalHandlers();
     this.logger.info('Worker started');
+
+    this.startDone = new Promise<void>((resolve) => {
+      this.stopResolve = resolve;
+    });
+    await this.startDone;
   }
 
   async stop(): Promise<void> {
@@ -325,6 +336,7 @@ export class Worker {
       this.promoteTimer = null;
     }
 
+    // Stop subscriptions without waiting on in-flight handlers indefinitely.
     if (this.jobSubscription) {
       await this.jobSubscription.stop();
       this.jobSubscription = null;
@@ -342,10 +354,20 @@ export class Worker {
         Promise.all(this.activeTasks),
         Bun.sleep(this.config.gracePeriod),
       ]);
+      if (this.activeTasks.size > 0) {
+        this.logger.warn(
+          `Force exiting with ${this.activeTasks.size} unfinished tasks`,
+        );
+      }
     }
 
     await this.provider.close();
     this.logger.info('Worker stopped');
+
+    const resolve = this.stopResolve;
+    this.stopResolve = null;
+    this.startDone = null;
+    resolve?.();
   }
 
   private async startTopicSub(sub: PendingTopicSub): Promise<void> {
@@ -372,11 +394,19 @@ export class Worker {
     this.topicSubscriptions.push(subscription);
   }
 
+  /**
+   * Queues this worker consumes.
+   * Config queues replace the default priority set, but dynamic queues from
+   * `on(..., { queue })` are always appended so those tasks are still consumed.
+   */
   private getQueueNames(): string[] {
     if (this.config.queues && this.config.queues.length > 0) {
-      return [...this.config.queues]
+      const fromConfig = [...this.config.queues]
         .sort((a, b) => a.priority - b.priority)
         .map((q) => q.name);
+      const configSet = new Set(fromConfig);
+      const extras = [...this.registeredQueues].filter((n) => !configSet.has(n));
+      return [...fromConfig, ...extras];
     }
     const names = [
       Priority.URGENT,
@@ -483,5 +513,4 @@ export class Worker {
   }
 }
 
-// silence unused Queue import warning by referencing for runtime queue registration compatibility
 void Queue;

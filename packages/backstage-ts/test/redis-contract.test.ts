@@ -6,17 +6,18 @@ describe('RedisStreamsProvider contract', () => {
   test(
     'passes shared provider contract suite',
     async () => {
+      const prefix = `rpc-${Date.now()}`;
       await runProviderContract(
         () =>
           new RedisStreamsProvider({
             host: 'localhost',
             port: 6379,
-            prefix: `rpc-${Date.now()}`,
-            reclaimIntervalMs: 200,
-            blockTimeout: 200,
+            prefix,
+            reclaimIntervalMs: 150,
+            blockTimeout: 150,
           }),
       );
     },
-    { timeout: 60_000 },
+    { timeout: 90_000 },
   );
 });

@@ -63,3 +63,25 @@ describe('Capability resolution', () => {
     expect(report.dedupe.available).toBe(true);
   });
 });
+
+describe('Worker start/stop semantics', () => {
+  test('second start() throws while running', async () => {
+    const provider = new (await import('../src/provider/redis')).RedisStreamsProvider({
+      host: 'localhost',
+      port: 6379,
+      prefix: `start-${Date.now()}`,
+      blockTimeout: 100,
+      reclaimIntervalMs: 60_000,
+    });
+    const worker = new Worker({
+      provider,
+      consumerGroup: 'start-test',
+      workerId: 'start-w',
+    });
+    const started = worker.start();
+    await Bun.sleep(80);
+    await expect(worker.start()).rejects.toThrow('already running');
+    await worker.stop();
+    await started;
+  });
+});

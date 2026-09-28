@@ -30,13 +30,12 @@ describe('Worker Custom Queues', () => {
   });
 
   test('mixes config and dynamic queues', () => {
-    // Config queues replace defaults entirely
+    // Config queues replace defaults, but on(..., {queue}) queues are still consumed
     const worker = new Worker({
       queues: [new Queue('config-queue')],
     });
     worker.on('dynamic.task', async () => {}, { queue: 'dynamic-queue' });
     const names = (worker as any).getQueueNames() as string[];
-    // With config.queues set, only those are used (overrides defaults)
-    expect(names).toEqual(['config-queue']);
+    expect(names.sort()).toEqual(['config-queue', 'dynamic-queue'].sort());
   });
 });
