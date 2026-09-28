@@ -73,26 +73,23 @@ describe('Queue Override — Worker', () => {
     }
   });
 
-  test('stream only subscribes to custom queues', () => {
+  test('worker with custom queues only uses those queues', () => {
     const worker = new Worker({
       queues: [new Queue('custom-only')],
     });
-
-    const stream = (worker as any).stream;
-    const keys = stream.getStreamKeys() as string[];
-    expect(keys).toEqual(['backstage:custom-only']);
-    expect(keys).not.toContain('backstage:urgent');
-    expect(keys).not.toContain('backstage:default');
-    expect(keys).not.toContain('backstage:low');
+    const names = (worker as any).getQueueNames() as string[];
+    expect(names).toEqual(['custom-only']);
+    expect(names).not.toContain('urgent');
+    expect(names).not.toContain('default');
+    expect(names).not.toContain('low');
   });
 
   test('worker with no config queues uses defaults', () => {
     const worker = new Worker();
-    const stream = (worker as any).stream;
-    const keys = stream.getStreamKeys() as string[];
-    expect(keys).toContain('backstage:urgent');
-    expect(keys).toContain('backstage:default');
-    expect(keys).toContain('backstage:low');
+    const names = (worker as any).getQueueNames() as string[];
+    expect(names).toContain('urgent');
+    expect(names).toContain('default');
+    expect(names).toContain('low');
   });
 });
 

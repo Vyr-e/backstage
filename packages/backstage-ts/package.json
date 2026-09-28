@@ -1,6 +1,6 @@
 {
   "name": "@vyr-e/backstage",
-  "version": "1.1.4",
+  "version": "1.2.0",
   "module": "dist/index.js",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -43,6 +43,11 @@
       "types": "./dist/types.d.ts",
       "import": "./dist/types.js",
       "require": "./dist/types.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "import": "./dist/testing/index.js",
+      "require": "./dist/testing/index.js"
     }
   },
   "scripts": {

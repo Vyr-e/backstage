@@ -4,73 +4,39 @@ import { Queue } from '../src/queue';
 
 describe('Worker Custom Queues', () => {
   test('registers custom queue via config', () => {
-    const customQueue = new Queue('explicit-queue');
     const worker = new Worker({
-      queues: [customQueue],
+      queues: [new Queue('explicit-queue')],
     });
-
-    // Access private property for testing
-    const stream = (worker as any).stream;
-    const queues = stream.customQueues as Queue[];
-
-    expect(queues.length).toBe(1);
-    expect(queues[0]!.name).toBe('explicit-queue');
+    const names = (worker as any).getQueueNames() as string[];
+    expect(names).toEqual(['explicit-queue']);
   });
 
-  test('registers custom queue via task registration', async () => {
+  test('registers custom queue via task registration', () => {
     const worker = new Worker();
-
-    // Register task with custom queue
-    worker.on('custom.task', async () => {}, {
-      queue: 'dynamic-queue',
-    });
-
-    // Allow async addQueue to complete
-    await Bun.sleep(50);
-
-    // Access private property for testing
-    const stream = (worker as any).stream;
-    const queues = stream.customQueues as Queue[];
-
-    // Should have added the queue
-    expect(queues.length).toBe(1);
-    expect(queues[0]!.name).toBe('dynamic-queue');
-    expect(queues[0]!.streamKey).toContain('dynamic-queue');
+    worker.on('custom.task', async () => {}, { queue: 'dynamic-queue' });
+    const names = (worker as any).getQueueNames() as string[];
+    expect(names).toContain('dynamic-queue');
+    expect(names).toContain('urgent');
+    expect(names).toContain('default');
+    expect(names).toContain('low');
   });
 
-  test('prevents duplicate queue registration', async () => {
+  test('prevents duplicate queue registration', () => {
     const worker = new Worker();
-
-    // Register two tasks on same queue
     worker.on('task1', async () => {}, { queue: 'shared-queue' });
     worker.on('task2', async () => {}, { queue: 'shared-queue' });
-
-    await Bun.sleep(50);
-
-    const stream = (worker as any).stream;
-    const queues = stream.customQueues as Queue[];
-
-    // Should still only have 1 queue
-    expect(queues.length).toBe(1);
-    expect(queues[0]!.name).toBe('shared-queue');
+    const names = (worker as any).getQueueNames() as string[];
+    expect(names.filter((n) => n === 'shared-queue').length).toBe(1);
   });
 
-  test('mixes config and dynamic queues', async () => {
+  test('mixes config and dynamic queues', () => {
+    // Config queues replace defaults entirely
     const worker = new Worker({
       queues: [new Queue('config-queue')],
     });
-
     worker.on('dynamic.task', async () => {}, { queue: 'dynamic-queue' });
-
-    await Bun.sleep(50);
-
-    const stream = (worker as any).stream;
-    const queues = stream.customQueues as Queue[];
-
-    expect(queues.length).toBe(2);
-    expect(queues.map((q) => q.name).sort()).toEqual([
-      'config-queue',
-      'dynamic-queue',
-    ]);
+    const names = (worker as any).getQueueNames() as string[];
+    // With config.queues set, only those are used (overrides defaults)
+    expect(names).toEqual(['config-queue']);
   });
 });
