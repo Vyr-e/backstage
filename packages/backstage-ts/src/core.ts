@@ -93,6 +93,10 @@ export type {
 export {
   RedisStreamsProvider,
   type RedisStreamsProviderConfig,
+  RabbitMQProvider,
+  type RabbitMQProviderConfig,
+  KafkaProvider,
+  type KafkaProviderConfig,
 } from './provider';
 export {
   WIRE_PREFIX,
