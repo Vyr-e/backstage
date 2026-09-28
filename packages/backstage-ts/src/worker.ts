@@ -1,4 +1,4 @@
-import { SoftTimeout, HardTimeout } from './exceptions';
+import { HardTimeout } from './exceptions';
 import { Logger, createLogger, LogLevel, type LoggerConfig } from './logger';
 import { ScriptRegistry } from './script-registry';
 import { Queue } from './queue';

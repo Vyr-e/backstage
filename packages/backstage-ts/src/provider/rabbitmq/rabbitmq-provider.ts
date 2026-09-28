@@ -1,4 +1,4 @@
-import amqp, { type Channel, type ChannelModel, type GetMessage, type ConsumeMessage, type Message } from 'amqplib';
+import amqp, { type Channel, type ChannelModel, type Message } from 'amqplib';
 import type { BackoffConfig } from '../../types';
 import type {
   BackstageProvider,
