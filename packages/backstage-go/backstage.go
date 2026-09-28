@@ -88,6 +88,7 @@ type Client struct {
 	resolved      ResolvedCapabilities
 	overrides     *Capabilities
 	redisProvider *RedisStreamsProvider
+	initErr       error
 
 	jobSub           Subscription
 	topicSubs        []Subscription
@@ -95,12 +96,7 @@ type Client struct {
 	subMu            sync.Mutex
 	consumerCfg      ConsumerConfig
 	promoteStop      chan struct{}
-
-	// Batched ACK support (legacy helpers for tests)
-	pendingAcks map[string][]string
-	ackChan     chan ackRequest
-	ackWg       sync.WaitGroup
-	ackMu       sync.Mutex
+	activeWg         sync.WaitGroup
 
 	customQueues []string
 	queuesMu     sync.RWMutex
@@ -141,11 +137,6 @@ func FromLatest() SubscribeOption {
 	return func(s *pendingTopicSub) { s.from = TopicFromLatest }
 }
 
-type ackRequest struct {
-	stream string
-	id     string
-}
-
 // Handler is a task handler function.
 type Handler func(ctx context.Context, payload json.RawMessage) (*WorkflowInstruction, error)
 
@@ -165,12 +156,10 @@ func New(cfg Config) *Client {
 	}
 
 	c := &Client{
-		config:      cfg,
-		handlers:    make(map[string]Handler),
-		logger:      NewLogger("Backstage"),
-		pendingAcks: make(map[string][]string),
-		ackChan:     make(chan ackRequest, 1000),
-		overrides:   cfg.Capabilities,
+		config:    cfg,
+		handlers:  make(map[string]Handler),
+		logger:    NewLogger("Backstage"),
+		overrides: cfg.Capabilities,
 	}
 
 	if cfg.Provider != nil {
@@ -189,16 +178,29 @@ func New(cfg Config) *Client {
 		c.redis = rp.Redis()
 	}
 
+	// Resolve before init so Init sees plugged overrides; re-resolve after so
+	// providers that discover capabilities during Init (e.g. Rabbit delayed plugin)
+	// are visible to start() checks.
 	resolved, err := ResolveCapabilities(c.provider, c.overrides)
 	if err != nil {
 		c.resolved = ResolvedCapabilities{}
-	} else {
-		c.resolved = resolved
+		c.initErr = err
+		return c
 	}
-	_ = c.provider.Init(context.Background(), ProviderContext{
+	c.resolved = resolved
+	if initErr := c.provider.Init(context.Background(), ProviderContext{
 		Capabilities: c.resolved,
 		Logger:       c.logger,
-	})
+	}); initErr != nil {
+		c.initErr = initErr
+		return c
+	}
+	resolved, err = ResolveCapabilities(c.provider, c.overrides)
+	if err != nil {
+		c.initErr = err
+		return c
+	}
+	c.resolved = resolved
 	return c
 }
 
@@ -214,6 +216,10 @@ func (c *Client) Redis() *redis.Client {
 func (c *Client) Capabilities() CapabilityReport {
 	return BuildCapabilityReport(c.provider, c.resolved, c.overrides)
 }
+
+// InitError returns any error from provider.Init during New.
+func (c *Client) InitError() error { return c.initErr }
+
 
 // RegisterQueue adds a custom queue for the consumer to monitor.
 func (c *Client) RegisterQueue(name string) {

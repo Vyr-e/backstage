@@ -81,12 +81,15 @@ export class Scheduler {
     }
 
     this.resolved = resolveCapabilities(this.provider, config.capabilities);
-    this.providerReady = this.provider.init
+    this.providerReady = (this.provider.init
       ? this.provider.init({
           capabilities: this.resolved,
           logger: this.logger,
         })
-      : Promise.resolve();
+      : Promise.resolve()
+    ).then(() => {
+      this.resolved = resolveCapabilities(this.provider, config.capabilities);
+    });
   }
 
   /**

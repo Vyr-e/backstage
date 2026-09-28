@@ -122,6 +122,7 @@ export class Worker {
         deleteOnAck: this.config.deleteOnAck,
         blockTimeout: this.config.blockTimeout,
         reclaimIntervalMs: this.config.reclaimerInterval,
+        idleTimeoutMs: this.config.idleTimeout,
         maxDeliveries: this.config.maxDeliveries,
       });
       this.provider = redisProvider;
@@ -146,6 +147,9 @@ export class Worker {
         logger: this.logger,
       });
     }
+    // Re-resolve after init so providers that discover capabilities during init
+    // (e.g. RabbitMQ delayed-message plugin) pass start() checks.
+    this.resolved = resolveCapabilities(this.provider, this.overrides);
   }
 
   capabilities(): CapabilityReport {

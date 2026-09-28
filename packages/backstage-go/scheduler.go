@@ -110,9 +110,20 @@ func NewScheduler(cfg SchedulerConfig) *Scheduler {
 		s.redisProvider = rp
 		s.redis = rp.Redis()
 	}
-	resolved, _ := ResolveCapabilities(s.provider, cfg.Capabilities)
+	resolved, err := ResolveCapabilities(s.provider, cfg.Capabilities)
+	if err != nil {
+		s.resolved = ResolvedCapabilities{}
+		return s
+	}
 	s.resolved = resolved
-	_ = s.provider.Init(context.Background(), ProviderContext{Capabilities: resolved, Logger: s.logger})
+	if initErr := s.provider.Init(context.Background(), ProviderContext{Capabilities: resolved, Logger: s.logger}); initErr != nil {
+		s.logger.Error("provider init failed", "error", initErr)
+		return s
+	}
+	resolved, err = ResolveCapabilities(s.provider, cfg.Capabilities)
+	if err == nil {
+		s.resolved = resolved
+	}
 	return s
 }
 
