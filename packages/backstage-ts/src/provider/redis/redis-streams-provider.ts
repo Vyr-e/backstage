@@ -695,7 +695,7 @@ export class RedisStreamsProvider implements BackstageProvider {
             clearInterval(cleanupTimer);
             await Promise.race([
               loop,
-              Bun.sleep(Math.min(self.blockTimeout, 500) + 50),
+              Bun.sleep(Math.max(self.blockTimeout, 500) + 100),
             ]);
           },
         };

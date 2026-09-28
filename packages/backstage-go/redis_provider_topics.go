@@ -103,9 +103,13 @@ func (t *redisTopics) Subscribe(ctx context.Context, opts TopicSubscribeOptions,
 		once.Do(func() {
 			running.Store(false)
 			cancel()
+			wait := t.p.blockTimeout + 100*time.Millisecond
+			if wait < 500*time.Millisecond {
+				wait = 500 * time.Millisecond
+			}
 			select {
 			case <-done:
-			case <-time.After(100 * time.Millisecond):
+			case <-time.After(wait):
 			}
 		})
 	}}, nil
