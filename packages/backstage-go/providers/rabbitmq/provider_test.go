@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -205,4 +207,137 @@ func TestRabbitReconnectAfterBrokerKill(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("job after broker restart not processed")
 	}
+}
+
+func TestRabbitTopicRetryFanoutIsolation(t *testing.T) {
+	ctx := context.Background()
+	prefix := fmt.Sprintf("topic-retry-%d", time.Now().UnixNano())
+	p := rabbitmq.New(rabbitmq.Config{URL: "amqp://guest:guest@localhost:5672/", Prefix: prefix, MaxDeliveries: 5})
+	if err := p.Init(ctx, backstage.ProviderContext{
+		Capabilities: backstage.ResolvedCapabilities{Jobs: p.Jobs(), Topics: p.Topics()},
+		Logger:       backstage.NewLogger("t"),
+	}); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	defer p.Close()
+
+	topic := "orders.placed"
+	stableCh := make(chan int, 8)
+	flakyCh := make(chan int, 8)
+	var flakyAttempts atomic.Int32
+
+	stable, err := p.Topics().Subscribe(ctx, backstage.TopicSubscribeOptions{
+		Topic: topic, ConsumerID: "stable-1", From: backstage.TopicFromEarliest,
+	}, func(ctx context.Context, m backstage.TopicDelivery) error {
+		stableCh <- m.DeliveryCount()
+		return nil // handleTopicDelivery acks on success
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stable.Stop(ctx)
+
+	flaky, err := p.Topics().Subscribe(ctx, backstage.TopicSubscribeOptions{
+		Topic: topic, ConsumerID: "flaky-1", From: backstage.TopicFromEarliest,
+	}, func(ctx context.Context, m backstage.TopicDelivery) error {
+		flakyCh <- m.DeliveryCount()
+		if flakyAttempts.Add(1) == 1 {
+			return fmt.Errorf("flaky once")
+		}
+		return nil // handleTopicDelivery acks on success
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer flaky.Stop(ctx)
+
+	time.Sleep(500 * time.Millisecond)
+	if _, err := p.Topics().Publish(ctx, topic, map[string]string{"id": "m1"}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	var stableCounts, flakyCounts []int
+	deadline := time.After(20 * time.Second)
+	for len(stableCounts) < 1 || len(flakyCounts) < 2 {
+		select {
+		case c := <-stableCh:
+			stableCounts = append(stableCounts, c)
+		case c := <-flakyCh:
+			flakyCounts = append(flakyCounts, c)
+		case <-deadline:
+			t.Fatalf("timeout: stable=%v flaky=%v", stableCounts, flakyCounts)
+		}
+	}
+	// Drain any unexpected extras briefly
+	time.Sleep(500 * time.Millisecond)
+	for {
+		select {
+		case c := <-stableCh:
+			stableCounts = append(stableCounts, c)
+		default:
+			goto check
+		}
+	}
+check:
+	if len(stableCounts) != 1 || stableCounts[0] != 1 {
+		t.Fatalf("stable subscriber should get exactly 1 copy (count=1), got %v", stableCounts)
+	}
+	if len(flakyCounts) != 2 || flakyCounts[0] != 1 || flakyCounts[1] != 2 {
+		t.Fatalf("flaky subscriber should get [1,2], got %v", flakyCounts)
+	}
+}
+
+// TestRabbitPublishThroughput publishes 5k messages concurrently.
+// Bound: must finish within 15s. The old serialized confirm path held a mutex
+// across each confirm wait and would typically exceed this under concurrent load.
+func TestRabbitPublishThroughput(t *testing.T) {
+	const n = 5000
+	const maxDuration = 15 * time.Second
+	const concurrency = 64
+
+	ctx := context.Background()
+	prefix := fmt.Sprintf("thrput-%d", time.Now().UnixNano())
+	p := rabbitmq.New(rabbitmq.Config{URL: "amqp://guest:guest@localhost:5672/", Prefix: prefix})
+	if err := p.Init(ctx, backstage.ProviderContext{
+		Capabilities: backstage.ResolvedCapabilities{Jobs: p.Jobs(), Topics: p.Topics()},
+		Logger:       backstage.NewLogger("t"),
+	}); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	defer p.Close()
+
+	q := "work"
+	if err := p.Jobs().EnsureQueues(ctx, []string{q}); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	sem := make(chan struct{}, concurrency)
+	errCh := make(chan error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			_, err := p.Jobs().Publish(ctx, backstage.OutgoingJob{
+				Queue: q, TaskName: "t", Payload: map[string]int{"i": i},
+				EnqueuedAt: time.Now().UnixMilli(),
+			})
+			if err != nil {
+				errCh <- err
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	elapsed := time.Since(start)
+	for err := range errCh {
+		t.Fatalf("publish error: %v", err)
+	}
+	if elapsed > maxDuration {
+		t.Fatalf("%d concurrent publishes took %v, want <= %v (deferred confirms)", n, elapsed, maxDuration)
+	}
+	t.Logf("%d concurrent publishes in %v", n, elapsed)
 }

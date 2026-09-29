@@ -191,3 +191,63 @@ describe('RabbitMQ production fixes', () => {
     expect(processed).toContain('after');
   }, 90_000);
 });
+
+describe('RabbitMQ topic retry isolation', () => {
+  test('fan-out retry reaches only the failing subscriber', async () => {
+    await assertRabbitUp();
+    const prefix = `topic-retry-${Date.now()}`;
+    const p = new RabbitMQProvider({
+      url: process.env.RABBITMQ_URL ?? 'amqp://guest:guest@localhost:5672',
+      prefix,
+      maxDeliveries: 5,
+    });
+    await p.init({
+      capabilities: { jobs: p.jobs, topics: p.topics },
+      logger: { info() {}, warn() {}, error() {}, debug() {} } as any,
+    });
+
+    const topic = 'orders.placed';
+    const stableCounts: number[] = [];
+    const flakyCounts: number[] = [];
+    let flakyAttempts = 0;
+
+    const stable = await p.topics.subscribe(
+      { topic, consumerId: 'stable-1', from: 'earliest' },
+      async (m) => {
+        stableCounts.push(m.deliveryCount);
+        // wrapper acks on success
+      },
+    );
+    const flaky = await p.topics.subscribe(
+      { topic, consumerId: 'flaky-1', from: 'earliest' },
+      async (m) => {
+        flakyCounts.push(m.deliveryCount);
+        flakyAttempts++;
+        if (flakyAttempts === 1) {
+          throw new Error('flaky once');
+        }
+        // wrapper acks on success
+      },
+    );
+
+    await Bun.sleep(500);
+    await p.topics.publish(topic, { id: 'm1' });
+
+    const deadline = Date.now() + 20_000;
+    while (
+      (stableCounts.length < 1 || flakyCounts.length < 2) &&
+      Date.now() < deadline
+    ) {
+      await Bun.sleep(100);
+    }
+
+    await stable.stop();
+    await flaky.stop();
+    await p.close();
+
+    expect(stableCounts.length).toBe(1);
+    expect(stableCounts[0]).toBe(1);
+    expect(flakyCounts.length).toBe(2);
+    expect(flakyCounts).toEqual([1, 2]);
+  }, 45_000);
+});

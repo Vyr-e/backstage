@@ -23,12 +23,11 @@ type Provider struct {
 	name          string
 	url           string
 	prefix        string
-	maxDeliveries  int
+	maxDeliveries int
 	mu            sync.Mutex
-	pubMu         sync.Mutex
+	pubMu         sync.Mutex // brief lock around PublishWithDeferredConfirm only
 	conn          *amqp.Connection
 	pub           *amqp.Channel
-	pubConfirms   chan amqp.Confirmation
 	ctx           *backstage.ProviderContext
 	jobs          *jobsCap
 	topics        *topicsCap
@@ -91,11 +90,26 @@ func (p *Provider) Init(ctx context.Context, pctx backstage.ProviderContext) err
 	return nil
 }
 
+// connect dials (or reuses) the shared AMQP connection and publisher channel.
+// Always closes any previous connection before replacing it to avoid leaks.
 func (p *Provider) connect() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.connectLocked()
+}
+
+func (p *Provider) connectLocked() error {
 	if p.conn != nil && !p.conn.IsClosed() && p.pub != nil {
 		return nil
+	}
+	// Close leftovers before dialing a fresh connection (no leaked conns).
+	if p.pub != nil {
+		_ = p.pub.Close()
+		p.pub = nil
+	}
+	if p.conn != nil {
+		_ = p.conn.Close()
+		p.conn = nil
 	}
 	conn, err := amqp.Dial(p.url)
 	if err != nil {
@@ -111,57 +125,90 @@ func (p *Provider) connect() error {
 		_ = conn.Close()
 		return fmt.Errorf("enable publisher confirms: %w", err)
 	}
-	confirms := ch.NotifyPublish(make(chan amqp.Confirmation, 32))
 	p.conn = conn
 	p.pub = ch
-	p.pubConfirms = confirms
 	return nil
 }
 
-func (p *Provider) ensurePub() (*amqp.Channel, chan amqp.Confirmation, error) {
+// recreatePubChannel recreates only the publisher channel on the existing
+// connection. Does not tear down the connection or other consumer channels.
+func (p *Provider) recreatePubChannel() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.conn == nil || p.conn.IsClosed() {
+		return p.connectLocked()
+	}
+	if p.pub != nil {
+		_ = p.pub.Close()
+		p.pub = nil
+	}
+	ch, err := p.conn.Channel()
+	if err != nil {
+		// Connection itself may be dead — full reconnect.
+		_ = p.conn.Close()
+		p.conn = nil
+		return p.connectLocked()
+	}
+	if err := ch.Confirm(false); err != nil {
+		_ = ch.Close()
+		return fmt.Errorf("enable publisher confirms: %w", err)
+	}
+	p.pub = ch
+	return nil
+}
+
+func (p *Provider) ensurePub() (*amqp.Channel, error) {
 	if err := p.connect(); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.pub, p.pubConfirms, nil
+	return p.pub, nil
 }
 
+// publishConfirmed uses deferred confirms so callers are not serialized behind
+// one mutex while waiting for each broker ack. The mutex only covers the
+// Publish call itself (delivery-tag assignment); WaitContext runs unlocked.
 func (p *Provider) publishConfirmed(ctx context.Context, exchange, key string, msg amqp.Publishing) error {
-	p.pubMu.Lock()
-	defer p.pubMu.Unlock()
-	ch, confirms, err := p.ensurePub()
+	dc, err := p.publishDeferred(ctx, exchange, key, msg)
 	if err != nil {
-		return err
-	}
-	if err := ch.PublishWithContext(ctx, exchange, key, false, false, msg); err != nil {
-		// channel/connection may be dead — clear and retry once
-		p.mu.Lock()
-		p.pub = nil
-		p.conn = nil
-		p.mu.Unlock()
-		ch, confirms, err = p.ensurePub()
+		// Channel/connection may be dead — recreate pub channel (or conn) once.
+		if rerr := p.recreatePubChannel(); rerr != nil {
+			return err
+		}
+		dc, err = p.publishDeferred(ctx, exchange, key, msg)
 		if err != nil {
 			return err
 		}
-		if err := ch.PublishWithContext(ctx, exchange, key, false, false, msg); err != nil {
-			return err
-		}
 	}
-	select {
-	case conf, ok := <-confirms:
-		if !ok {
-			return fmt.Errorf("confirm channel closed")
-		}
-		if !conf.Ack {
-			return fmt.Errorf("broker nacked publish to %s/%s", exchange, key)
-		}
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(30 * time.Second):
-		return fmt.Errorf("timed out waiting for publish confirm")
+	if dc == nil {
+		return fmt.Errorf("publisher confirms not enabled")
 	}
+	waitCtx := ctx
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		waitCtx, cancel = context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+	}
+	acked, err := dc.WaitContext(waitCtx)
+	if err != nil {
+		return err
+	}
+	if !acked {
+		return fmt.Errorf("broker nacked publish to %s/%s", exchange, key)
+	}
+	return nil
+}
+
+func (p *Provider) publishDeferred(ctx context.Context, exchange, key string, msg amqp.Publishing) (*amqp.DeferredConfirmation, error) {
+	ch, err := p.ensurePub()
+	if err != nil {
+		return nil, err
+	}
+	p.pubMu.Lock()
+	dc, err := ch.PublishWithDeferredConfirmWithContext(ctx, exchange, key, false, false, msg)
+	p.pubMu.Unlock()
+	return dc, err
 }
 
 func (p *Provider) Close() error {
@@ -193,7 +240,7 @@ func (j *jobsCap) Requires() []backstage.CapabilityName {
 }
 
 func (j *jobsCap) EnsureQueues(ctx context.Context, queues []string) error {
-	ch, _, err := j.p.ensurePub()
+	ch, err := j.p.ensurePub()
 	if err != nil {
 		return err
 	}
@@ -256,6 +303,10 @@ func (j *jobsCap) Consume(ctx context.Context, opts backstage.ConsumeOptions, on
 
 func (j *jobsCap) consumeLoop(ctx context.Context, running *atomic.Bool, opts backstage.ConsumeOptions, onDelivery func(context.Context, backstage.JobDelivery) error) {
 	backoff := time.Second
+	prefetch := opts.Prefetch
+	if prefetch <= 0 {
+		prefetch = 1
+	}
 	for running.Load() && !j.p.closed.Load() {
 		if err := j.p.connect(); err != nil {
 			if j.p.ctx != nil && j.p.ctx.Logger != nil {
@@ -275,18 +326,17 @@ func (j *jobsCap) consumeLoop(ctx context.Context, running *atomic.Bool, opts ba
 		j.p.mu.Lock()
 		conn := j.p.conn
 		j.p.mu.Unlock()
-		if conn == nil {
+		if conn == nil || conn.IsClosed() {
 			continue
 		}
 		ch, err := conn.Channel()
 		if err != nil {
-			j.p.mu.Lock()
-			j.p.conn = nil
-			j.p.pub = nil
-			j.p.mu.Unlock()
+			if conn.IsClosed() {
+				j.p.clearConnIf(conn)
+			}
 			continue
 		}
-		_ = ch.Qos(opts.Prefetch, 0, false)
+		_ = ch.Qos(prefetch, 0, false)
 		closeCh := conn.NotifyClose(make(chan *amqp.Error, 1))
 		chanClose := ch.NotifyClose(make(chan *amqp.Error, 1))
 
@@ -307,13 +357,13 @@ func (j *jobsCap) consumeLoop(ctx context.Context, running *atomic.Bool, opts ba
 		}
 		if !ok {
 			_ = ch.Close()
-			j.p.mu.Lock()
-			j.p.conn = nil
-			j.p.pub = nil
-			j.p.mu.Unlock()
+			if conn.IsClosed() {
+				j.p.clearConnIf(conn)
+			}
 			continue
 		}
 
+		sem := make(chan struct{}, prefetch)
 		var feedWg sync.WaitGroup
 		for _, f := range feeds {
 			feedWg.Add(1)
@@ -323,29 +373,63 @@ func (j *jobsCap) consumeLoop(ctx context.Context, running *atomic.Bool, opts ba
 					if !running.Load() {
 						return
 					}
-					delivery := j.toDelivery(ch, queue, d)
-					_ = onDelivery(ctx, delivery)
+					sem <- struct{}{}
+					go func(d amqp.Delivery) {
+						defer func() { <-sem }()
+						delivery := j.toDelivery(ch, queue, d)
+						_ = onDelivery(ctx, delivery)
+					}(d)
 				}
 			}(f.queue, f.ds)
 		}
 
+		connDied := false
 		select {
 		case <-ctx.Done():
 			_ = ch.Close()
 			feedWg.Wait()
+			// Drain in-flight handlers
+			for i := 0; i < prefetch; i++ {
+				sem <- struct{}{}
+			}
 			return
 		case <-closeCh:
+			connDied = true
 		case <-chanClose:
+			// Channel-only failure: leave shared connection alone so other
+			// consumers/publishers keep working.
 		}
 		_ = ch.Close()
 		feedWg.Wait()
-		j.p.mu.Lock()
-		j.p.conn = nil
-		j.p.pub = nil
-		j.p.mu.Unlock()
-		if running.Load() && j.p.ctx != nil && j.p.ctx.Logger != nil {
-			j.p.ctx.Logger.Warn("rabbitmq connection/channel lost; reconnecting")
+		for i := 0; i < prefetch; i++ {
+			sem <- struct{}{}
 		}
+		if connDied {
+			j.p.clearConnIf(conn)
+			if running.Load() && j.p.ctx != nil && j.p.ctx.Logger != nil {
+				j.p.ctx.Logger.Warn("rabbitmq connection lost; reconnecting")
+			}
+		} else if running.Load() && j.p.ctx != nil && j.p.ctx.Logger != nil {
+			j.p.ctx.Logger.Warn("rabbitmq consumer channel lost; recreating channel")
+		}
+	}
+}
+
+// clearConnIf drops the shared connection only if it is still the one that died,
+// closing it first so it is never leaked.
+func (p *Provider) clearConnIf(conn *amqp.Connection) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.conn != conn {
+		return
+	}
+	if p.pub != nil {
+		_ = p.pub.Close()
+		p.pub = nil
+	}
+	if p.conn != nil {
+		_ = p.conn.Close()
+		p.conn = nil
 	}
 }
 
@@ -437,7 +521,7 @@ func (d *delayedDelays) Schedule(ctx context.Context, job backstage.OutgoingJob,
 	_, bound := d.p.boundQueues[job.Queue]
 	d.p.mu.Unlock()
 	if !bound {
-		ch, _, err := d.p.ensurePub()
+		ch, err := d.p.ensurePub()
 		if err != nil {
 			return "", err
 		}
@@ -462,7 +546,7 @@ type topicsCap struct{ p *Provider }
 func (t *topicsCap) Name() string { return "rabbitmq" }
 func (t *topicsCap) Publish(ctx context.Context, topic string, payload interface{}) (string, error) {
 	ex := t.p.prefix + ".topics"
-	ch, _, err := t.p.ensurePub()
+	ch, err := t.p.ensurePub()
 	if err != nil {
 		return "", err
 	}
@@ -493,6 +577,7 @@ func (t *topicsCap) Subscribe(ctx context.Context, opts backstage.TopicSubscribe
 
 func (t *topicsCap) subscribeLoop(ctx context.Context, running *atomic.Bool, opts backstage.TopicSubscribeOptions, onMessage func(context.Context, backstage.TopicDelivery) error) {
 	backoff := time.Second
+	const prefetch = 10
 	for running.Load() && !t.p.closed.Load() {
 		if err := t.p.connect(); err != nil {
 			select {
@@ -509,13 +594,17 @@ func (t *topicsCap) subscribeLoop(ctx context.Context, running *atomic.Bool, opt
 		t.p.mu.Lock()
 		conn := t.p.conn
 		t.p.mu.Unlock()
-		if conn == nil {
+		if conn == nil || conn.IsClosed() {
 			continue
 		}
 		ch, err := conn.Channel()
 		if err != nil {
+			if conn.IsClosed() {
+				t.p.clearConnIf(conn)
+			}
 			continue
 		}
+		_ = ch.Qos(prefetch, 0, false)
 		ex := t.p.prefix + ".topics"
 		_ = ch.ExchangeDeclare(ex, "topic", true, false, false, false, nil)
 		var q amqp.Queue
@@ -536,6 +625,7 @@ func (t *topicsCap) subscribeLoop(ctx context.Context, running *atomic.Bool, opt
 		}
 		closeCh := conn.NotifyClose(make(chan *amqp.Error, 1))
 		chanClose := ch.NotifyClose(make(chan *amqp.Error, 1))
+		sem := make(chan struct{}, prefetch)
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
@@ -543,27 +633,38 @@ func (t *topicsCap) subscribeLoop(ctx context.Context, running *atomic.Bool, opt
 				if !running.Load() {
 					return
 				}
-				t.handleTopicDelivery(ctx, ch, opts, d, onMessage)
+				sem <- struct{}{}
+				go func(d amqp.Delivery) {
+					defer func() { <-sem }()
+					t.handleTopicDelivery(ctx, q.Name, opts, d, onMessage)
+				}(d)
 			}
 		}()
+		connDied := false
 		select {
 		case <-ctx.Done():
 			_ = ch.Close()
 			<-done
+			for i := 0; i < prefetch; i++ {
+				sem <- struct{}{}
+			}
 			return
 		case <-closeCh:
+			connDied = true
 		case <-chanClose:
 		}
 		_ = ch.Close()
 		<-done
-		t.p.mu.Lock()
-		t.p.conn = nil
-		t.p.pub = nil
-		t.p.mu.Unlock()
+		for i := 0; i < prefetch; i++ {
+			sem <- struct{}{}
+		}
+		if connDied {
+			t.p.clearConnIf(conn)
+		}
 	}
 }
 
-func (t *topicsCap) handleTopicDelivery(ctx context.Context, ch *amqp.Channel, opts backstage.TopicSubscribeOptions, d amqp.Delivery, onMessage func(context.Context, backstage.TopicDelivery) error) {
+func (t *topicsCap) handleTopicDelivery(ctx context.Context, queueName string, opts backstage.TopicSubscribeOptions, d amqp.Delivery, onMessage func(context.Context, backstage.TopicDelivery) error) {
 	var body map[string]json.RawMessage
 	_ = json.Unmarshal(d.Body, &body)
 	payload := body["payload"]
@@ -586,12 +687,12 @@ func (t *topicsCap) handleTopicDelivery(ctx context.Context, ch *amqp.Channel, o
 			_ = d.Ack(false)
 			return
 		}
-		// Republish with incremented count, then ack — no instant requeue loop
+		// Republish to this subscriber's queue only (default exchange), not the
+		// topic exchange — other fan-out subscribers must not get the retry.
 		next, _ := json.Marshal(map[string]interface{}{
 			"payload": json.RawMessage(payload), "publishedAt": publishedAt, "deliveryCount": count + 1,
 		})
-		ex := t.p.prefix + ".topics"
-		if pubErr := t.p.publishConfirmed(ctx, ex, opts.Topic, amqp.Publishing{DeliveryMode: amqp.Persistent, Body: next}); pubErr != nil {
+		if pubErr := t.p.publishConfirmed(ctx, "", queueName, amqp.Publishing{DeliveryMode: amqp.Persistent, Body: next}); pubErr != nil {
 			// leave unacked for broker redelivery after reconnect
 			return
 		}
@@ -609,12 +710,12 @@ type topicDel struct {
 	count       int
 }
 
-func (t *topicDel) ID() string                       { return fmt.Sprintf("%d", t.d.DeliveryTag) }
-func (t *topicDel) Topic() string                    { return t.topic }
-func (t *topicDel) Payload() json.RawMessage         { return t.payload }
-func (t *topicDel) PublishedAt() int64               { return t.publishedAt }
-func (t *topicDel) DeliveryCount() int               { return t.count }
-func (t *topicDel) Ack(ctx context.Context) error    { return t.d.Ack(false) }
+func (t *topicDel) ID() string                    { return fmt.Sprintf("%d", t.d.DeliveryTag) }
+func (t *topicDel) Topic() string                 { return t.topic }
+func (t *topicDel) Payload() json.RawMessage      { return t.payload }
+func (t *topicDel) PublishedAt() int64            { return t.publishedAt }
+func (t *topicDel) DeliveryCount() int            { return t.count }
+func (t *topicDel) Ack(ctx context.Context) error { return t.d.Ack(false) }
 
 type sub struct{ stop func() }
 

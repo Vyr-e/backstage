@@ -508,9 +508,12 @@ export class RabbitMQProvider implements BackstageProvider {
                       return;
                     }
                     try {
+                      // Retry to this subscriber's queue only (default exchange),
+                      // not the topic exchange — other fan-out subscribers must
+                      // not receive the retry copy.
                       await self.publishConfirmed(
-                        exchange,
-                        opts.topic,
+                        '',
+                        queueName,
                         Buffer.from(
                           JSON.stringify({
                             payload: body.payload,
