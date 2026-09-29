@@ -4,7 +4,7 @@ go 1.22
 
 require (
 	github.com/segmentio/kafka-go v0.4.47
-	github.com/vyr-e/backstage/packages/backstage-go v1.1.1
+	github.com/vyr-e/backstage/packages/backstage-go v1.1.2
 )
 
 require (
