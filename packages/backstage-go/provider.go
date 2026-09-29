@@ -111,6 +111,15 @@ type Dedupe interface {
 	Claim(ctx context.Context, key string, ttlMs int64) (bool, error)
 }
 
+// DelayPromoter is implemented by delay stores that hold due jobs until
+// something moves them onto the jobs transport (Redis keeps them in a ZSET).
+// Whatever the provider, a consuming Client binds it to the resolved jobs
+// capability and runs its promote loop, so Redis delays work under Kafka.
+type DelayPromoter interface {
+	BindJobs(jobs Jobs)
+	Promote(ctx context.Context) (int64, error)
+}
+
 type ResolvedCapabilities struct {
 	Jobs   Jobs
 	Topics Topics

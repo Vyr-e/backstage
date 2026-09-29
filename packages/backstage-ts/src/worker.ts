@@ -8,6 +8,7 @@ import { Logger, createLogger, LogLevel, type LoggerConfig } from './logger';
 import {
   buildCapabilityReport,
   formatCapabilityReport,
+  isDelayPromoter,
   requireCapability,
   resolveCapabilities,
   type BackstageProvider,
@@ -314,10 +315,14 @@ export class Worker {
       await this.startTopicSub(sub);
     }
 
-    // One promote loop in the worker only (not in producers / provider.schedule)
-    if (this.resolved.delays && this.redisProvider) {
+    // One promote loop in the worker only (not in producers / provider.schedule).
+    // Keyed on the delays capability, not the provider: Redis delays plugged
+    // into Kafka still need promoting onto Kafka.
+    const delays = this.resolved.delays;
+    if (isDelayPromoter(delays)) {
+      delays.bindJobs(this.resolved.jobs);
       this.promoteTimer = setInterval(() => {
-        this.redisProvider!.promoteCrossProvider().catch(() => {});
+        delays.promote().catch(() => {});
       }, 1000);
     }
 

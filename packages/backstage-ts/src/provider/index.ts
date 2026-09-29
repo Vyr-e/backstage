@@ -6,6 +6,7 @@ export type {
   CapabilityReportEntry,
   ConsumeOptions,
   DedupeCapability,
+  DelayPromoter,
   DelaysCapability,
   JobDelivery,
   JobsCapability,
@@ -18,6 +19,7 @@ export type {
   TopicsCapability,
 } from './types';
 export { CapabilityMissingError } from './errors';
+export { isDelayPromoter } from './types';
 export {
   buildCapabilityReport,
   formatCapabilityReport,

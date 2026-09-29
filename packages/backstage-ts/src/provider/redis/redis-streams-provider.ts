@@ -17,6 +17,7 @@ import type {
   BackstageProvider,
   ConsumeOptions,
   DedupeCapability,
+  DelayPromoter,
   DelaysCapability,
   JobDelivery,
   JobsCapability,
@@ -166,7 +167,7 @@ export class RedisStreamsProvider implements BackstageProvider {
   readonly name = 'redis-streams';
   readonly jobs: JobsCapability;
   readonly topics: TopicsCapability;
-  readonly delays: DelaysCapability;
+  readonly delays: DelaysCapability & DelayPromoter;
   readonly dedupe: DedupeCapability;
 
   readonly redis: RedisClient;
@@ -180,6 +181,8 @@ export class RedisStreamsProvider implements BackstageProvider {
   private readonly reclaimIntervalMs: number;
   private readonly maxDeliveries: number;
   private ctx: ProviderContext | null = null;
+  // Set by delays.bindJobs; overrides ctx jobs for promotion.
+  private promoteJobs: JobsCapability | null = null;
   private ownsClient: boolean;
 
   constructor(config: RedisStreamsProviderConfig = {}) {
@@ -535,7 +538,7 @@ export class RedisStreamsProvider implements BackstageProvider {
     }
   }
 
-  private createDelays(): DelaysCapability {
+  private createDelays(): DelaysCapability & DelayPromoter {
     const self = this;
     return {
       name: 'redis-streams',
@@ -559,6 +562,12 @@ export class RedisStreamsProvider implements BackstageProvider {
         // Promote loop lives only in the Worker — producers must not run one.
         return `scheduled:${runAt}`;
       },
+      bindJobs(jobs: JobsCapability): void {
+        self.promoteJobs = jobs;
+      },
+      promote(): Promise<number> {
+        return self.promoteCrossProvider();
+      },
     };
   }
 
@@ -567,8 +576,8 @@ export class RedisStreamsProvider implements BackstageProvider {
    * Also retries stuck members in scheduled:claimed (cross-provider path).
    */
   async promoteCrossProvider(): Promise<number> {
-    if (!this.ctx) return 0;
-    const jobs = this.ctx.capabilities.jobs;
+    const jobs = this.promoteJobs ?? this.ctx?.capabilities.jobs;
+    if (!jobs) return 0;
     if (jobs.name === 'redis-streams') {
       const result = await this.redis.send('EVAL', [
         PROCESS_SCHEDULED_LUA,

@@ -109,8 +109,10 @@ func (c *Client) Start(ctx context.Context, cfg ConsumerConfig) error {
 		}
 	}
 
-	// Single promote loop in the worker only
-	if c.resolved.Delays != nil && c.redisProvider != nil {
+	// Single promote loop in the worker only. Keyed on the delays capability,
+	// not the provider: Redis delays plugged into Kafka still need promoting.
+	if promoter, ok := c.resolved.Delays.(DelayPromoter); ok {
+		promoter.BindJobs(c.resolved.Jobs)
 		c.lifeMu.Lock()
 		c.promoteStop = make(chan struct{})
 		stopCh := c.promoteStop
@@ -121,7 +123,7 @@ func (c *Client) Start(ctx context.Context, cfg ConsumerConfig) error {
 			for {
 				select {
 				case <-t.C:
-					_, _ = c.redisProvider.PromoteCrossProvider(context.Background())
+					_, _ = promoter.Promote(context.Background())
 				case <-stopCh:
 					return
 				}

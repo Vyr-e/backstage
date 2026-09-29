@@ -82,6 +82,27 @@ export interface DelaysCapability {
   schedule(job: OutgoingJob, runAt: number): Promise<string>;
 }
 
+/**
+ * Implemented by delay stores that hold due jobs until something moves them
+ * onto the jobs transport (Redis keeps them in a ZSET). Whatever the provider,
+ * a started Worker binds it to the resolved jobs capability and runs its
+ * promote loop, so Redis delays work under Kafka.
+ */
+export interface DelayPromoter {
+  bindJobs(jobs: JobsCapability): void;
+  promote(): Promise<number>;
+}
+
+export function isDelayPromoter(
+  delays: DelaysCapability | undefined,
+): delays is DelaysCapability & DelayPromoter {
+  return (
+    !!delays &&
+    typeof (delays as Partial<DelayPromoter>).bindJobs === 'function' &&
+    typeof (delays as Partial<DelayPromoter>).promote === 'function'
+  );
+}
+
 export interface DedupeCapability {
   name: string;
   claim(key: string, ttlMs: number): Promise<boolean>;

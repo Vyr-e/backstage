@@ -23,6 +23,7 @@ export type {
   CapabilityReportEntry,
   ConsumeOptions,
   DedupeCapability,
+  DelayPromoter,
   DelaysCapability,
   JobDelivery,
   JobsCapability,
@@ -39,6 +40,7 @@ export {
   CapabilityMissingError,
   buildCapabilityReport,
   formatCapabilityReport,
+  isDelayPromoter,
   requireCapability,
   resolveCapabilities,
 } from './provider';

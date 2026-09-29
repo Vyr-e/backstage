@@ -48,6 +48,7 @@ type RedisStreamsProvider struct {
 	maxDeliveries    int
 	ownsClient       bool
 	pctx             *ProviderContext
+	promoteJobs      Jobs // set by BindJobs; overrides pctx jobs for promotion
 	jobs             *redisJobs
 	topics           *redisTopics
 	delays           *redisDelays
@@ -508,10 +509,13 @@ func (d *redisJobDelivery) DeadLetter(ctx context.Context, opts DeadLetterOpts) 
 
 // PromoteCrossProvider promotes due delayed jobs. Called by Client Start loop only.
 func (p *RedisStreamsProvider) PromoteCrossProvider(ctx context.Context) (int64, error) {
-	if p.pctx == nil {
-		return 0, nil
+	jobs := p.promoteJobs
+	if jobs == nil {
+		if p.pctx == nil {
+			return 0, nil
+		}
+		jobs = p.pctx.Capabilities.Jobs
 	}
-	jobs := p.pctx.Capabilities.Jobs
 	if jobs == nil || jobs.Name() == "redis-streams" {
 		result, err := p.redis.Eval(ctx, ProcessScheduledLua, []string{ScheduledKey(p.prefix)},
 			time.Now().UnixMilli(), p.prefix, string(PriorityDefault)).Result()

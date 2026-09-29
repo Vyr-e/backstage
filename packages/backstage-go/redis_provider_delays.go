@@ -49,6 +49,14 @@ func (d *redisDelays) Schedule(ctx context.Context, job OutgoingJob, runAt int64
 	return fmt.Sprintf("scheduled:%d", runAt), nil
 }
 
+// BindJobs makes due jobs promote onto jobs (the active transport).
+func (d *redisDelays) BindJobs(jobs Jobs) { d.p.promoteJobs = jobs }
+
+// Promote moves due delayed jobs onto the bound transport.
+func (d *redisDelays) Promote(ctx context.Context) (int64, error) {
+	return d.p.PromoteCrossProvider(ctx)
+}
+
 type redisDedupe struct{ p *RedisStreamsProvider }
 
 func (d *redisDedupe) Name() string { return "redis-streams" }
