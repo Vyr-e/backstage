@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -122,31 +124,30 @@ func RunProviderContract(t *testing.T, create CreateProvider, opts Options) {
 			Queue: q2, TaskName: "contract.prefetch", Payload: map[string]int{"i": i}, EnqueuedAt: time.Now().UnixMilli(),
 		})
 	}
-	var peak, inFlight, acked int
+	var peak, inFlight, acked atomic.Int32
 	donePf := make(chan struct{})
+	var donePfOnce sync.Once
 	subPf, _ := provider.Jobs().Consume(ctx, backstage.ConsumeOptions{
 		Queues: []string{q2}, Group: "cg-pf-" + prefix, ConsumerID: "cpf-" + prefix, Prefetch: 2, IdleTimeout: 2000,
 	}, func(ctx context.Context, d backstage.JobDelivery) error {
-		inFlight++
-		if inFlight > peak {
-			peak = inFlight
+		cur := inFlight.Add(1)
+		for {
+			p := peak.Load()
+			if cur <= p || peak.CompareAndSwap(p, cur) {
+				break
+			}
 		}
 		time.Sleep(80 * time.Millisecond)
-		inFlight--
-		acked++
-		if acked >= 5 {
-			select {
-			case <-donePf:
-			default:
-				close(donePf)
-			}
+		inFlight.Add(-1)
+		if acked.Add(1) >= 5 {
+			donePfOnce.Do(func() { close(donePf) })
 		}
 		return d.Ack(ctx)
 	})
 	waitChan(t, donePf, timeout)
 	_ = subPf.Stop(ctx)
-	if peak > 2 {
-		t.Fatalf("prefetch exceeded: peak=%d", peak)
+	if peak.Load() > 2 {
+		t.Fatalf("prefetch exceeded: peak=%d", peak.Load())
 	}
 
 	// retry delay + deliveryCount
@@ -275,31 +276,24 @@ func RunProviderContract(t *testing.T, create CreateProvider, opts Options) {
 	// topics
 	if !opts.SkipTopics && provider.Topics() != nil {
 		topic := "t." + prefix
-		var a, b int
+		var a, b atomic.Int32
 		doneFan := make(chan struct{})
+		var doneFanOnce sync.Once
 		subA, _ := provider.Topics().Subscribe(ctx, backstage.TopicSubscribeOptions{
 			Topic: topic, ConsumerID: "fan-a-" + prefix, From: backstage.TopicFromLatest,
 		}, func(ctx context.Context, m backstage.TopicDelivery) error {
-			a++
-			if a >= 1 && b >= 1 {
-				select {
-				case <-doneFan:
-				default:
-					close(doneFan)
-				}
+			a.Add(1)
+			if a.Load() >= 1 && b.Load() >= 1 {
+				doneFanOnce.Do(func() { close(doneFan) })
 			}
 			return m.Ack(ctx)
 		})
 		subB, _ := provider.Topics().Subscribe(ctx, backstage.TopicSubscribeOptions{
 			Topic: topic, ConsumerID: "fan-b-" + prefix, From: backstage.TopicFromLatest,
 		}, func(ctx context.Context, m backstage.TopicDelivery) error {
-			b++
-			if a >= 1 && b >= 1 {
-				select {
-				case <-doneFan:
-				default:
-					close(doneFan)
-				}
+			b.Add(1)
+			if a.Load() >= 1 && b.Load() >= 1 {
+				doneFanOnce.Do(func() { close(doneFan) })
 			}
 			return m.Ack(ctx)
 		})
@@ -308,33 +302,26 @@ func RunProviderContract(t *testing.T, create CreateProvider, opts Options) {
 		waitChan(t, doneFan, timeout)
 		_ = subA.Stop(ctx)
 		_ = subB.Stop(ctx)
-		if a < 1 || b < 1 {
-			t.Fatalf("fanout a=%d b=%d", a, b)
+		if a.Load() < 1 || b.Load() < 1 {
+			t.Fatalf("fanout a=%d b=%d", a.Load(), b.Load())
 		}
 
 		// group exactly one
-		var g1, g2 int
+		var g1, g2 atomic.Int32
 		doneG := make(chan struct{})
+		var doneGOnce sync.Once
 		gSub1, _ := provider.Topics().Subscribe(ctx, backstage.TopicSubscribeOptions{
 			Topic: topic + ".g", Group: "billing-" + prefix, ConsumerID: "g1-" + prefix, From: backstage.TopicFromLatest,
 		}, func(ctx context.Context, m backstage.TopicDelivery) error {
-			g1++
-			select {
-			case <-doneG:
-			default:
-				close(doneG)
-			}
+			g1.Add(1)
+			doneGOnce.Do(func() { close(doneG) })
 			return m.Ack(ctx)
 		})
 		gSub2, _ := provider.Topics().Subscribe(ctx, backstage.TopicSubscribeOptions{
 			Topic: topic + ".g", Group: "billing-" + prefix, ConsumerID: "g2-" + prefix, From: backstage.TopicFromLatest,
 		}, func(ctx context.Context, m backstage.TopicDelivery) error {
-			g2++
-			select {
-			case <-doneG:
-			default:
-				close(doneG)
-			}
+			g2.Add(1)
+			doneGOnce.Do(func() { close(doneG) })
 			return m.Ack(ctx)
 		})
 		time.Sleep(2 * time.Second)
@@ -343,8 +330,8 @@ func RunProviderContract(t *testing.T, create CreateProvider, opts Options) {
 		time.Sleep(200 * time.Millisecond)
 		_ = gSub1.Stop(ctx)
 		_ = gSub2.Stop(ctx)
-		if g1+g2 != 1 {
-			t.Fatalf("group expected 1 got %d+%d", g1, g2)
+		if g1.Load()+g2.Load() != 1 {
+			t.Fatalf("group expected 1 got %d+%d", g1.Load(), g2.Load())
 		}
 
 		// durability while members down

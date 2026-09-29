@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -26,11 +27,11 @@ const StreamPrefix = "backstage"
 
 // Message represents a task message.
 type Message struct {
-	ID           string          `json:"id,omitempty"`
-	TaskName     string          `json:"taskName"`
-	Payload      json.RawMessage `json:"payload"`
-	EnqueuedAt   int64           `json:"enqueuedAt"`
-	DeliveryCount int            `json:"deliveryCount,omitempty"`
+	ID            string          `json:"id,omitempty"`
+	TaskName      string          `json:"taskName"`
+	Payload       json.RawMessage `json:"payload"`
+	EnqueuedAt    int64           `json:"enqueuedAt"`
+	DeliveryCount int             `json:"deliveryCount,omitempty"`
 }
 
 // WorkflowInstruction for chaining tasks.
@@ -49,16 +50,16 @@ type Config struct {
 	ConsumerGroup string
 	WorkerID      string
 	// Prefix for Redis keys (default: "backstage")
-	Prefix        string
+	Prefix string
 	// Queues specifies the exact queues to subscribe to.
 	// If set, these replace the default priority queues (urgent, default, low).
-	Queues        []string
+	Queues []string
 	// DeleteOnAck removes a message from its stream after it is successfully
 	// processed and acknowledged (XDEL follows XACK), keeping stream length
 	// bounded instead of growing forever. Safe in the default pattern where a
 	// single consumer group drains each work queue; leave false if another
 	// consumer group replays the same streams. Does not affect broadcast.
-	DeleteOnAck   bool
+	DeleteOnAck bool
 
 	// Provider swaps the transport (nil = Redis Streams from Host/Port/...).
 	Provider Provider
@@ -83,7 +84,7 @@ type Client struct {
 	config        Config
 	handlers      map[string]Handler
 	logger        *Logger
-	running       bool
+	running       atomic.Bool
 	provider      Provider
 	resolved      ResolvedCapabilities
 	overrides     *Capabilities
@@ -94,6 +95,7 @@ type Client struct {
 	topicSubs        []Subscription
 	pendingTopicSubs []pendingTopicSub
 	subMu            sync.Mutex
+	lifeMu           sync.Mutex // Start/Stop lifecycle fields
 	consumerCfg      ConsumerConfig
 	promoteStop      chan struct{}
 	activeWg         sync.WaitGroup
@@ -220,12 +222,11 @@ func (c *Client) Capabilities() CapabilityReport {
 // InitError returns any error from provider.Init during New.
 func (c *Client) InitError() error { return c.initErr }
 
-
 // RegisterQueue adds a custom queue for the consumer to monitor.
 func (c *Client) RegisterQueue(name string) {
 	c.queuesMu.Lock()
 	defer c.queuesMu.Unlock()
-	
+
 	for _, q := range c.customQueues {
 		if q == name {
 			return
@@ -243,7 +244,7 @@ func (c *Client) LogQueues(ctx context.Context, interval time.Duration) {
 		select {
 		case <-ticker.C:
 			var queues []*Queue
-			
+
 			// Get active queues (respects Config.Queues override)
 			for _, streamKey := range c.getQueues() {
 				// Strip prefix to get queue name
@@ -258,15 +259,15 @@ func (c *Client) LogQueues(ctx context.Context, interval time.Duration) {
 			}
 
 			for _, q := range info.Queues {
-				c.logger.Info("Queue status", 
-					"queue", q.Name, 
-					"pending", q.Pending, 
-					"scheduled", q.Scheduled, 
+				c.logger.Info("Queue status",
+					"queue", q.Name,
+					"pending", q.Pending,
+					"scheduled", q.Scheduled,
 					"dead_letter", q.DeadLetter)
 			}
-			c.logger.Info("Total status", 
-				"pending", info.TotalPending, 
-				"scheduled", info.TotalScheduled, 
+			c.logger.Info("Total status",
+				"pending", info.TotalPending,
+				"scheduled", info.TotalScheduled,
 				"dead_letter", info.TotalDL)
 
 		case <-ctx.Done():

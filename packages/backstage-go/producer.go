@@ -123,7 +123,7 @@ func (c *Client) Subscribe(topic string, handler TopicHandler, opts ...Subscribe
 	}
 	c.subMu.Lock()
 	c.pendingTopicSubs = append(c.pendingTopicSubs, sub)
-	running := c.running
+	running := c.running.Load()
 	c.subMu.Unlock()
 	if running {
 		go func() {

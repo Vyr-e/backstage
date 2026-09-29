@@ -37,16 +37,20 @@ func (c *Client) Start(ctx context.Context, cfg ConsumerConfig) error {
 	if c.initErr != nil {
 		return c.initErr
 	}
-	if c.running {
+	c.lifeMu.Lock()
+	if c.running.Load() {
+		c.lifeMu.Unlock()
 		return fmt.Errorf("worker is already running")
 	}
-	c.running = true
 	c.consumerCfg = cfg
 	c.activeWg = sync.WaitGroup{}
+	c.promoteStop = nil
+	c.running.Store(true)
+	c.lifeMu.Unlock()
 
 	if len(c.pendingTopicSubs) > 0 {
 		if _, err := RequireTopics(c.provider.Name(), c.resolved); err != nil {
-			c.running = false
+			c.running.Store(false)
 			return err
 		}
 	}
@@ -54,17 +58,17 @@ func (c *Client) Start(ctx context.Context, cfg ConsumerConfig) error {
 		switch req {
 		case CapabilityDelays:
 			if _, err := RequireDelays(c.provider.Name(), c.resolved); err != nil {
-				c.running = false
+				c.running.Store(false)
 				return err
 			}
 		case CapabilityDedupe:
 			if _, err := RequireDedupe(c.provider.Name(), c.resolved); err != nil {
-				c.running = false
+				c.running.Store(false)
 				return err
 			}
 		case CapabilityTopics:
 			if _, err := RequireTopics(c.provider.Name(), c.resolved); err != nil {
-				c.running = false
+				c.running.Store(false)
 				return err
 			}
 		}
@@ -94,7 +98,7 @@ func (c *Client) Start(ctx context.Context, cfg ConsumerConfig) error {
 		Prefetch: prefetch, IdleTimeout: cfg.IdleTimeout.Milliseconds(),
 	}, c.onJobDelivery)
 	if err != nil {
-		c.running = false
+		c.running.Store(false)
 		return err
 	}
 	c.jobSub = sub
@@ -107,23 +111,26 @@ func (c *Client) Start(ctx context.Context, cfg ConsumerConfig) error {
 
 	// Single promote loop in the worker only
 	if c.resolved.Delays != nil && c.redisProvider != nil {
+		c.lifeMu.Lock()
 		c.promoteStop = make(chan struct{})
-		go func() {
+		stopCh := c.promoteStop
+		c.lifeMu.Unlock()
+		go func(stopCh chan struct{}) {
 			t := time.NewTicker(time.Second)
 			defer t.Stop()
 			for {
 				select {
 				case <-t.C:
 					_, _ = c.redisProvider.PromoteCrossProvider(context.Background())
-				case <-c.promoteStop:
+				case <-stopCh:
 					return
 				}
 			}
-		}()
+		}(stopCh)
 	}
 
 	// Block until stopped (master behavior)
-	for c.running {
+	for c.running.Load() {
 		select {
 		case <-ctx.Done():
 			c.Stop()
@@ -212,19 +219,23 @@ func (c *Client) onJobDelivery(ctx context.Context, d JobDelivery) error {
 }
 
 func (c *Client) Stop() {
-	if !c.running {
+	c.lifeMu.Lock()
+	if !c.running.CompareAndSwap(true, false) {
+		c.lifeMu.Unlock()
 		return
 	}
-	c.running = false
-	if c.promoteStop != nil {
+	stopCh := c.promoteStop
+	grace := c.consumerCfg.GracePeriod
+	c.lifeMu.Unlock()
+
+	if stopCh != nil {
 		select {
-		case <-c.promoteStop:
+		case <-stopCh:
 		default:
-			close(c.promoteStop)
+			close(stopCh)
 		}
 	}
 
-	grace := c.consumerCfg.GracePeriod
 	if grace <= 0 {
 		grace = 30 * time.Second
 	}
