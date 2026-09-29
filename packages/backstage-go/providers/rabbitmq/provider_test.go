@@ -93,7 +93,6 @@ func TestRabbitDeadLetterPublishFailureDoesNotAck(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer sub.Stop(ctx)
 
 	var d backstage.JobDelivery
 	select {
@@ -108,9 +107,10 @@ func TestRabbitDeadLetterPublishFailureDoesNotAck(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected deadLetter to fail when broker down")
 	}
+	_ = sub.Stop(ctx)
 	// Restart and ensure message is still available (not acked)
 	_ = exec.Command("sudo", "docker", "start", "bs-rabbit").Run()
-	time.Sleep(5 * time.Second)
+	time.Sleep(6 * time.Second)
 
 	got2 := make(chan struct{}, 1)
 	p2 := rabbitmq.New(rabbitmq.Config{URL: "amqp://guest:guest@localhost:5672/", Prefix: prefix})

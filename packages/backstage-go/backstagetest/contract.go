@@ -80,7 +80,7 @@ func RunProviderContract(t *testing.T, create CreateProvider, opts Options) {
 		Queue: qCrash, TaskName: "contract.crash", Payload: map[string]bool{"once": true}, EnqueuedAt: time.Now().UnixMilli(),
 	})
 	crashSeen := make(chan struct{}, 1)
-	sub1, _ := provider.Jobs().Consume(ctx, backstage.ConsumeOptions{
+	sub1, err := provider.Jobs().Consume(ctx, backstage.ConsumeOptions{
 		Queues: []string{qCrash}, Group: "cg-crash-" + prefix, ConsumerID: "ca-" + prefix, Prefetch: 1, IdleTimeout: 150,
 	}, func(ctx context.Context, d backstage.JobDelivery) error {
 		select {
@@ -89,11 +89,14 @@ func RunProviderContract(t *testing.T, create CreateProvider, opts Options) {
 		}
 		return nil // no ack
 	})
+	if err != nil {
+		t.Fatalf("crash sub1: %v", err)
+	}
 	waitChan(t, crashSeen, timeout)
 	_ = sub1.Stop(ctx)
 
 	redelivered := make(chan struct{}, 1)
-	sub2, _ := provider.Jobs().Consume(ctx, backstage.ConsumeOptions{
+	sub2, err := provider.Jobs().Consume(ctx, backstage.ConsumeOptions{
 		Queues: []string{qCrash}, Group: "cg-crash-" + prefix, ConsumerID: "cb-" + prefix, Prefetch: 1, IdleTimeout: 100,
 	}, func(ctx context.Context, d backstage.JobDelivery) error {
 		if d.TaskName() == "contract.crash" && d.DeliveryCount() >= 2 {
@@ -105,6 +108,9 @@ func RunProviderContract(t *testing.T, create CreateProvider, opts Options) {
 		}
 		return d.Retry(ctx, backstage.RetryOpts{DelayMs: 50})
 	})
+	if err != nil {
+		t.Fatalf("crash sub2: %v", err)
+	}
 	waitChan(t, redelivered, timeout)
 	_ = sub2.Stop(ctx)
 
@@ -297,7 +303,7 @@ func RunProviderContract(t *testing.T, create CreateProvider, opts Options) {
 			}
 			return m.Ack(ctx)
 		})
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(2 * time.Second)
 		_, _ = provider.Topics().Publish(ctx, topic, map[string]int{"n": 1})
 		waitChan(t, doneFan, timeout)
 		_ = subA.Stop(ctx)
@@ -331,7 +337,7 @@ func RunProviderContract(t *testing.T, create CreateProvider, opts Options) {
 			}
 			return m.Ack(ctx)
 		})
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(2 * time.Second)
 		_, _ = provider.Topics().Publish(ctx, topic+".g", map[string]int{"n": 2})
 		waitChan(t, doneG, timeout)
 		time.Sleep(200 * time.Millisecond)

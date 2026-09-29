@@ -52,6 +52,34 @@ describe('KafkaProvider contract', () => {
         logger: { info() {}, warn() {}, error() {}, debug() {} } as any,
       });
 
+      const promo = setInterval(() => {
+        redisDelays.promoteCrossProvider().catch(() => {});
+      }, 50);
+
+      // Anchor kafka jobs into redis delays context so promote publishes to Kafka.
+      const anchor = new KafkaProvider({
+        brokers: [process.env.KAFKA_BROKER ?? 'localhost:9092'],
+        prefix,
+      });
+      await anchor.init({
+        capabilities: {
+          jobs: anchor.jobs,
+          topics: anchor.topics,
+          delays: redisDelays.delays,
+          dedupe: redisDelays.dedupe,
+        },
+        logger: { info() {}, warn() {}, error() {}, debug() {} } as any,
+      });
+      await redisDelays.init({
+        capabilities: {
+          jobs: anchor.jobs,
+          delays: redisDelays.delays,
+          dedupe: redisDelays.dedupe,
+          topics: redisDelays.topics,
+        },
+        logger: { info() {}, warn() {}, error() {}, debug() {} } as any,
+      });
+
       await runProviderContract(
         async () => {
           const p = new KafkaProvider({
@@ -75,6 +103,8 @@ describe('KafkaProvider contract', () => {
         },
         { timeoutMs: 60_000 },
       );
+      await anchor.close();
+      clearInterval(promo);
       await redisDelays.close();
     },
     { timeout: 120_000 },

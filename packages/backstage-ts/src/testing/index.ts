@@ -358,7 +358,7 @@ export async function runProviderContract(
         await m.ack();
       },
     );
-    await Bun.sleep(100);
+    await Bun.sleep(2000);
     await provider.topics.publish(topic, { n: 1 });
     await waitUntil(() => a >= 1 && b >= 1, timeoutMs);
     await subA.stop();
@@ -393,7 +393,7 @@ export async function runProviderContract(
         await m.ack();
       },
     );
-    await Bun.sleep(100);
+    await Bun.sleep(2000);
     await provider.topics.publish(`${topic}.g`, { n: 2 });
     await waitUntil(() => g1 + g2 >= 1, timeoutMs);
     await Bun.sleep(200);
