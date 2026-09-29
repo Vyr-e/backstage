@@ -376,6 +376,9 @@ func (p *RedisStreamsProvider) reclaimLoop(ctx context.Context, opts ConsumeOpti
 			Stream: sKey, Group: opts.Group, Idle: idle, Start: "-", End: "+", Count: 10,
 		}).Result()
 		if err != nil {
+			if p.pctx != nil && p.pctx.Logger != nil {
+				p.pctx.Logger.Error("Error checking pending messages", "error", err.Error(), "streamKey", sKey)
+			}
 			continue
 		}
 		for _, entry := range pending {

@@ -239,7 +239,7 @@ export class RabbitMQProvider implements BackstageProvider {
         onDelivery: (d: JobDelivery) => Promise<void>,
       ): Promise<Subscription> {
         let running = true;
-        let stopResolve: (() => void) | null = null;
+        let stopResolve!: () => void;
         const stopped = new Promise<void>((r) => {
           stopResolve = r;
         });
@@ -300,7 +300,7 @@ export class RabbitMQProvider implements BackstageProvider {
               backoff = Math.min(backoff * 2, 30_000);
             }
           }
-          stopResolve?.();
+          stopResolve();
         })();
 
         return {
@@ -447,7 +447,7 @@ export class RabbitMQProvider implements BackstageProvider {
         onMessage: (m: TopicDelivery) => Promise<void>,
       ): Promise<Subscription> {
         let running = true;
-        let stopResolve: (() => void) | null = null;
+        let stopResolve!: () => void;
         const stopped = new Promise<void>((r) => {
           stopResolve = r;
         });
@@ -551,7 +551,7 @@ export class RabbitMQProvider implements BackstageProvider {
               void err;
             }
           }
-          stopResolve?.();
+          stopResolve();
         })();
 
         return {

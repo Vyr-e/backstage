@@ -29,9 +29,9 @@ type OutgoingJob struct {
 }
 
 type JobMeta struct {
-	Attempts int
-	Backoff  *BackoffConfig
-	Timeout  int64 // ms; 0 = unset
+	Attempts int            `json:"attempts,omitempty"`
+	Backoff  *BackoffConfig `json:"backoff,omitempty"`
+	Timeout  int64          `json:"timeout,omitempty"` // ms; 0 = unset
 }
 
 type ConsumeOptions struct {

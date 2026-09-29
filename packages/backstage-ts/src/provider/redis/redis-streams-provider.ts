@@ -328,15 +328,24 @@ export class RedisStreamsProvider implements BackstageProvider {
   ): Promise<void> {
     for (const q of opts.queues) {
       const sKey = streamKey(this.prefix, q);
-      const pending = await this.redis.send('XPENDING', [
-        sKey,
-        opts.group,
-        'IDLE',
-        String(opts.idleTimeout),
-        '-',
-        '+',
-        '10',
-      ]);
+      let pending: unknown;
+      try {
+        pending = await this.redis.send('XPENDING', [
+          sKey,
+          opts.group,
+          'IDLE',
+          String(opts.idleTimeout),
+          '-',
+          '+',
+          '10',
+        ]);
+      } catch (err) {
+        this.ctx?.logger.error('Error checking pending messages', {
+          error: String(err),
+          streamKey: sKey,
+        });
+        continue;
+      }
       if (!pending || !Array.isArray(pending)) continue;
 
       for (const entry of pending) {
@@ -754,15 +763,24 @@ export class RedisStreamsProvider implements BackstageProvider {
     onMessage: (m: TopicDelivery) => Promise<void>,
   ): Promise<void> {
     const idle = String(this.idleTimeoutMs);
-    const pending = await this.redis.send('XPENDING', [
-      key,
-      group,
-      'IDLE',
-      idle,
-      '-',
-      '+',
-      '10',
-    ]);
+    let pending: unknown;
+    try {
+      pending = await this.redis.send('XPENDING', [
+        key,
+        group,
+        'IDLE',
+        idle,
+        '-',
+        '+',
+        '10',
+      ]);
+    } catch (err) {
+      this.ctx?.logger.error('Error checking pending messages', {
+        error: String(err),
+        streamKey: key,
+      });
+      return;
+    }
     if (!pending || !Array.isArray(pending)) return;
     for (const entry of pending) {
       if (!Array.isArray(entry) || entry.length < 4) continue;
