@@ -17,6 +17,16 @@ export interface KafkaProviderConfig {
   prefix?: string;
   /** Max topic delivery attempts before drop. Default 5. */
   maxDeliveries?: number;
+  /**
+   * Partitions for topics created via ensureQueues / admin.
+   * Default 3. Use 1 for single-broker test clusters.
+   */
+  partitions?: number;
+  /**
+   * Replication factor for topics created via ensureQueues / admin.
+   * Default 3. Use 1 for single-broker test clusters.
+   */
+  replicationFactor?: number;
 }
 
 type KafkaMsg = {
@@ -30,6 +40,10 @@ type KafkaMsg = {
 /**
  * Kafka transport: acks:all idempotent producer, contiguous offset commits,
  * jobs.requires=['delays']. No delays/dedupe built-in — plug them in.
+ *
+ * Limits / non-goals: does **not** use transactional producers and does
+ * **not** rely on log compaction. Topic creation defaults to 3 partitions
+ * and replicationFactor 3 (override via config; tests should use 1/1).
  */
 export class KafkaProvider implements BackstageProvider {
   readonly name = 'kafka';
@@ -40,6 +54,8 @@ export class KafkaProvider implements BackstageProvider {
   private readonly clientId: string;
   private readonly prefix: string;
   private readonly maxDeliveries: number;
+  private readonly partitions: number;
+  private readonly replicationFactor: number;
   private ctx: ProviderContext | null = null;
   private Kafka!: any;
   private kafka: any;
@@ -51,6 +67,8 @@ export class KafkaProvider implements BackstageProvider {
     this.clientId = config.clientId ?? 'backstage';
     this.prefix = config.prefix ?? 'backstage';
     this.maxDeliveries = config.maxDeliveries ?? 5;
+    this.partitions = config.partitions ?? 3;
+    this.replicationFactor = config.replicationFactor ?? 3;
     this.jobs = this.createJobs();
     this.topics = this.createTopics();
   }
@@ -106,13 +124,13 @@ export class KafkaProvider implements BackstageProvider {
           const topics = queues.flatMap((q) => [
             {
               topic: self.topicForQueue(q),
-              numPartitions: 1,
-              replicationFactor: 1,
+              numPartitions: self.partitions,
+              replicationFactor: self.replicationFactor,
             },
             {
               topic: self.dlqTopic(q),
-              numPartitions: 1,
-              replicationFactor: 1,
+              numPartitions: self.partitions,
+              replicationFactor: self.replicationFactor,
             },
           ]);
           await admin.createTopics({ topics, waitForLeaders: true });

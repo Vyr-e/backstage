@@ -49,3 +49,15 @@ client := backstage.New(backstage.Config{
 - RabbitMQ needs the delayed-message plugin **or** a plugged `delays` capability
   (retries require delays).
 - Kafka always needs plugged `delays` for retries (`jobs.requires = ['delays']`).
+
+## Kafka limits / non-goals
+
+Backstage's Kafka provider:
+
+- Does **not** use transactional producers.
+- Does **not** rely on log compaction.
+
+Topic creation defaults to **3 partitions** and **replicationFactor 3**.
+Single-broker (docker/test) clusters must set `partitions: 1` and
+`replicationFactor: 1` (TS) / `Partitions: 1, ReplicationFactor: 1` (Go).
+

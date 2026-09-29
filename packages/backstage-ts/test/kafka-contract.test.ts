@@ -60,6 +60,8 @@ describe('KafkaProvider contract', () => {
       const anchor = new KafkaProvider({
         brokers: [process.env.KAFKA_BROKER ?? 'localhost:9092'],
         prefix,
+        partitions: 1,
+        replicationFactor: 1,
       });
       await anchor.init({
         capabilities: {
@@ -85,6 +87,8 @@ describe('KafkaProvider contract', () => {
           const p = new KafkaProvider({
             brokers: [process.env.KAFKA_BROKER ?? 'localhost:9092'],
             prefix,
+            partitions: 1,
+            replicationFactor: 1,
           });
           const originalInit = p.init.bind(p);
           p.init = async (ctx) => {
@@ -126,6 +130,8 @@ describe('Kafka production fixes', () => {
     const p = new KafkaProvider({
       brokers: [process.env.KAFKA_BROKER ?? 'localhost:9092'],
       prefix,
+      partitions: 1,
+      replicationFactor: 1,
     });
     await p.init({
       capabilities: {

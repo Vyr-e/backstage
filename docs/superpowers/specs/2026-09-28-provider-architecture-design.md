@@ -304,6 +304,8 @@ the wire format**. Both SDKs must produce identical keys and fields.
 | Crash redelivery | Native: uncommitted offsets are re-read after rebalance |
 | Topics | Topic `{prefix}.topic.{topic}`. Fan-out: consumer group `{prefix}.sub.{consumerId}`; group: `{prefix}.grp.{group}` |
 | Delays / dedupe | Not provided — plug in Redis or custom |
+| Topic creation | Default **3 partitions**, **replicationFactor 3** (configurable; tests use 1/1) |
+| Limits / non-goals | No transactional producers; does not rely on log compaction |
 
 ## 9. Backward compatibility
 

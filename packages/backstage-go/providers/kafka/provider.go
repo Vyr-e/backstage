@@ -14,23 +14,34 @@ import (
 	"github.com/vyr-e/backstage/packages/backstage-go"
 )
 
+// Config configures the Kafka provider.
+//
+// Partitions and ReplicationFactor default to 3 (production-oriented).
+// Single-broker test clusters must set both to 1.
+//
+// Limits / non-goals: Backstage Kafka does not use transactional producers
+// and does not rely on log compaction.
 type Config struct {
-	Brokers       []string
-	Prefix        string
-	MaxDeliveries int
+	Brokers           []string
+	Prefix            string
+	MaxDeliveries     int
+	Partitions        int // default 3; use 1 for single-broker tests
+	ReplicationFactor int // default 3; use 1 for single-broker tests
 }
 
 type Provider struct {
-	name          string
-	brokers       []string
-	prefix        string
-	maxDeliveries  int
-	ctx           *backstage.ProviderContext
-	jobs          *jobsCap
-	topics        *topicsCap
-	writer        *kafka.Writer
-	closed        atomic.Bool
-	mu            sync.Mutex
+	name              string
+	brokers           []string
+	prefix            string
+	maxDeliveries     int
+	partitions        int
+	replicationFactor int
+	ctx               *backstage.ProviderContext
+	jobs              *jobsCap
+	topics            *topicsCap
+	writer            *kafka.Writer
+	closed            atomic.Bool
+	mu                sync.Mutex
 }
 
 func New(cfg Config) *Provider {
@@ -46,7 +57,18 @@ func New(cfg Config) *Provider {
 	if maxD == 0 {
 		maxD = 5
 	}
-	p := &Provider{name: "kafka", brokers: brokers, prefix: prefix, maxDeliveries: maxD}
+	parts := cfg.Partitions
+	if parts == 0 {
+		parts = 3
+	}
+	rf := cfg.ReplicationFactor
+	if rf == 0 {
+		rf = 3
+	}
+	p := &Provider{
+		name: "kafka", brokers: brokers, prefix: prefix, maxDeliveries: maxD,
+		partitions: parts, replicationFactor: rf,
+	}
 	p.jobs = &jobsCap{p: p}
 	p.topics = &topicsCap{p: p}
 	return p
@@ -128,8 +150,8 @@ func (j *jobsCap) EnsureQueues(ctx context.Context, queues []string) error {
 	for _, q := range queues {
 		qt, dt := j.p.queueTopic(q), j.p.dlqTopic(q)
 		topics = append(topics,
-			kafka.TopicConfig{Topic: qt, NumPartitions: 1, ReplicationFactor: 1},
-			kafka.TopicConfig{Topic: dt, NumPartitions: 1, ReplicationFactor: 1},
+			kafka.TopicConfig{Topic: qt, NumPartitions: j.p.partitions, ReplicationFactor: j.p.replicationFactor},
+			kafka.TopicConfig{Topic: dt, NumPartitions: j.p.partitions, ReplicationFactor: j.p.replicationFactor},
 		)
 		names = append(names, qt, dt)
 	}
@@ -174,9 +196,6 @@ func isTopicExists(err error) bool {
 	s := err.Error()
 	return strings.Contains(s, "already exists") || strings.Contains(s, "TOPIC_ALREADY_EXISTS")
 }
-
-
-
 
 type wireJob struct {
 	TaskName      string            `json:"taskName"`
@@ -343,13 +362,13 @@ func (d *kDelivery) settle(ctx context.Context) error {
 	return err
 }
 
-func (d *kDelivery) ID() string               { return fmt.Sprintf("%s:%d:%d", d.m.Topic, d.m.Partition, d.m.Offset) }
-func (d *kDelivery) Queue() string            { return d.queue }
-func (d *kDelivery) TaskName() string         { return d.body.TaskName }
-func (d *kDelivery) Payload() json.RawMessage { return d.body.Payload }
-func (d *kDelivery) EnqueuedAt() int64        { return d.body.EnqueuedAt }
-func (d *kDelivery) DeliveryCount() int       { return d.count }
-func (d *kDelivery) Meta() backstage.JobMeta  { return d.body.Meta }
+func (d *kDelivery) ID() string                    { return fmt.Sprintf("%s:%d:%d", d.m.Topic, d.m.Partition, d.m.Offset) }
+func (d *kDelivery) Queue() string                 { return d.queue }
+func (d *kDelivery) TaskName() string              { return d.body.TaskName }
+func (d *kDelivery) Payload() json.RawMessage      { return d.body.Payload }
+func (d *kDelivery) EnqueuedAt() int64             { return d.body.EnqueuedAt }
+func (d *kDelivery) DeliveryCount() int            { return d.count }
+func (d *kDelivery) Meta() backstage.JobMeta       { return d.body.Meta }
 func (d *kDelivery) Ack(ctx context.Context) error { return d.settle(ctx) }
 func (d *kDelivery) Retry(ctx context.Context, opts backstage.RetryOpts) error {
 	delays := d.p.ctx.Capabilities.Delays
@@ -501,12 +520,12 @@ type topicDel struct {
 	count       int
 }
 
-func (t *topicDel) ID() string                       { return t.id }
-func (t *topicDel) Topic() string                    { return t.topic }
-func (t *topicDel) Payload() json.RawMessage         { return t.payload }
-func (t *topicDel) PublishedAt() int64               { return t.publishedAt }
-func (t *topicDel) DeliveryCount() int               { return t.count }
-func (t *topicDel) Ack(ctx context.Context) error    { return nil }
+func (t *topicDel) ID() string                    { return t.id }
+func (t *topicDel) Topic() string                 { return t.topic }
+func (t *topicDel) Payload() json.RawMessage      { return t.payload }
+func (t *topicDel) PublishedAt() int64            { return t.publishedAt }
+func (t *topicDel) DeliveryCount() int            { return t.count }
+func (t *topicDel) Ack(ctx context.Context) error { return nil }
 
 type sub struct{ stop func() }
 
@@ -574,7 +593,6 @@ func (t *contiguousTracker) contiguous() int64 {
 	return t.highest
 }
 
-
 func (p *Provider) ensureTopic(ctx context.Context, topic string) error {
 	conn, err := kafka.Dial("tcp", p.brokers[0])
 	if err != nil {
@@ -590,7 +608,7 @@ func (p *Provider) ensureTopic(ctx context.Context, topic string) error {
 		return err
 	}
 	defer cconn.Close()
-	_ = cconn.CreateTopics(kafka.TopicConfig{Topic: topic, NumPartitions: 1, ReplicationFactor: 1})
+	_ = cconn.CreateTopics(kafka.TopicConfig{Topic: topic, NumPartitions: p.partitions, ReplicationFactor: p.replicationFactor})
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		parts, err := cconn.ReadPartitions(topic)

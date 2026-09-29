@@ -32,7 +32,7 @@ func TestKafkaContract(t *testing.T) {
 		Host: "localhost", Port: 6379, Prefix: sharedPrefix + "-delays",
 	})
 
-	anchor := kafka.New(kafka.Config{Brokers: []string{"localhost:9092"}, Prefix: sharedPrefix})
+	anchor := kafka.New(kafka.Config{Brokers: []string{"localhost:9092"}, Prefix: sharedPrefix, Partitions: 1, ReplicationFactor: 1})
 	ctx := context.Background()
 	if err := anchor.Init(ctx, backstage.ProviderContext{
 		Capabilities: backstage.ResolvedCapabilities{Jobs: anchor.Jobs(), Topics: anchor.Topics()},
@@ -72,7 +72,7 @@ func TestKafkaContract(t *testing.T) {
 	defer close(stopPromo)
 
 	backstagetest.RunProviderContract(t, func() backstage.Provider {
-		p := kafka.New(kafka.Config{Brokers: []string{"localhost:9092"}, Prefix: sharedPrefix})
+		p := kafka.New(kafka.Config{Brokers: []string{"localhost:9092"}, Prefix: sharedPrefix, Partitions: 1, ReplicationFactor: 1})
 		return &kafkaWithDelays{Provider: p, delays: rp.Delays()}
 	}, backstagetest.Options{Timeout: 60 * time.Second})
 }
@@ -84,7 +84,7 @@ func TestKafkaReconnectAfterBrokerKill(t *testing.T) {
 		Host: "localhost", Port: 6379, Prefix: prefix + "-d",
 	})
 	p := &kafkaWithDelays{
-		Provider: kafka.New(kafka.Config{Brokers: []string{"localhost:9092"}, Prefix: prefix}),
+		Provider: kafka.New(kafka.Config{Brokers: []string{"localhost:9092"}, Prefix: prefix, Partitions: 1, ReplicationFactor: 1}),
 		delays:   rp.Delays(),
 	}
 	if err := p.Init(ctx, backstage.ProviderContext{

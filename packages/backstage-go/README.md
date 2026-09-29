@@ -158,3 +158,6 @@ client.Capabilities()
 RabbitMQ and Kafka ship as separate modules under `providers/`. Core keeps only `go-redis`.
 Legacy Broadcast is Redis-only and deprecated in favor of topics.
 See `docs/providers/`.
+
+Kafka topic creation defaults to 3 partitions / replicationFactor 3 (set both to 1 for
+single-broker tests). Limits / non-goals: no transactional producers; no log compaction.

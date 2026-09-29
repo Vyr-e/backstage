@@ -218,8 +218,13 @@ new Worker({ host: 'localhost', port: 6379 });
 new Worker({ provider: new RabbitMQProvider({ url: 'amqp://localhost' }) });
 
 // Kafka (peer: kafkajs) — plug delays/dedupe as needed
+// Defaults: 3 partitions, replicationFactor 3. Use 1/1 for single-broker tests.
+// Limits: no transactional producers; no log compaction.
 new Worker({
-  provider: new KafkaProvider({ brokers: ['localhost:9092'] }),
+  provider: new KafkaProvider({
+    brokers: ['localhost:9092'],
+    // partitions: 1, replicationFactor: 1, // for single-broker docker
+  }),
   capabilities: { /* delays, dedupe */ },
 });
 
