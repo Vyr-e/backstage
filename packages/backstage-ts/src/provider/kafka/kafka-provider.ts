@@ -61,6 +61,7 @@ export class KafkaProvider implements BackstageProvider {
   private kafka: any;
   private producer: any;
   private closed = false;
+  private readonly topicReady = new Map<string, Promise<void>>();
 
   constructor(config: KafkaProviderConfig = {}) {
     this.brokers = config.brokers ?? ['localhost:9092'];
@@ -105,6 +106,86 @@ export class KafkaProvider implements BackstageProvider {
     }
   }
 
+  /** Create topics that don't exist yet and wait until they have leaders. */
+  private async createTopicsAndWait(names: string[]): Promise<void> {
+    const admin = this.kafka.admin();
+    await admin.connect();
+    try {
+      await admin.createTopics({
+        topics: names.map((topic) => ({
+          topic,
+          numPartitions: this.partitions,
+          replicationFactor: this.replicationFactor,
+        })),
+        waitForLeaders: true,
+      });
+      // Extra metadata wait — waitForLeaders can still race with produce.
+      const deadline = Date.now() + 15_000;
+      while (Date.now() < deadline) {
+        let meta: any;
+        try {
+          meta = await admin.fetchTopicMetadata({ topics: names });
+        } catch {
+          // UNKNOWN_TOPIC_OR_PARTITION while the broker is still creating it.
+          await Bun.sleep(100);
+          continue;
+        }
+        const ready = names.every((n) =>
+          meta.topics.some((t: any) => t.name === n && !t.error && t.partitions?.length),
+        );
+        if (ready) break;
+        await Bun.sleep(100);
+      }
+    } finally {
+      await admin.disconnect();
+    }
+  }
+
+  /**
+   * On brokers without auto.create.topics.enable a topic exists only if we
+   * create it. Cached per topic; a failure is retried on the next call.
+   */
+  private ensureTopic(name: string): Promise<void> {
+    let ready = this.topicReady.get(name);
+    if (!ready) {
+      ready = this.createTopicsAndWait([name]).catch((err) => {
+        this.topicReady.delete(name);
+        throw err;
+      });
+      this.topicReady.set(name, ready);
+    }
+    return ready;
+  }
+
+  /**
+   * Pin a group that has never committed to the topic's current end, so
+   * 'latest' means "after subscribe() returned", not "whenever the group
+   * finally joined". Groups with commits keep their offsets. Best effort:
+   * if the group is already active, Kafka's own 'latest' applies.
+   */
+  private async pinNewGroupToEnd(groupId: string, topic: string): Promise<void> {
+    const admin = this.kafka.admin();
+    await admin.connect();
+    try {
+      const committed = await admin.fetchOffsets({ groupId, topics: [topic] });
+      const partitions = committed[0]?.partitions ?? [];
+      if (partitions.some((p: { offset: string }) => p.offset !== '-1')) return;
+      const ends = await admin.fetchTopicOffsets(topic);
+      await admin.setOffsets({
+        groupId,
+        topic,
+        partitions: ends.map((e: { partition: number; high: string }) => ({
+          partition: e.partition,
+          offset: e.high,
+        })),
+      });
+    } catch {
+      // Active group or old broker: fall back to Kafka's 'latest'.
+    } finally {
+      await admin.disconnect();
+    }
+  }
+
   private topicForQueue(queue: string): string {
     return `${this.prefix}.${queue}`;
   }
@@ -118,36 +199,9 @@ export class KafkaProvider implements BackstageProvider {
       name: 'kafka',
       requires: ['delays'],
       async ensureQueues(queues: string[]): Promise<void> {
-        const admin = self.kafka.admin();
-        await admin.connect();
-        try {
-          const topics = queues.flatMap((q) => [
-            {
-              topic: self.topicForQueue(q),
-              numPartitions: self.partitions,
-              replicationFactor: self.replicationFactor,
-            },
-            {
-              topic: self.dlqTopic(q),
-              numPartitions: self.partitions,
-              replicationFactor: self.replicationFactor,
-            },
-          ]);
-          await admin.createTopics({ topics, waitForLeaders: true });
-          // Extra metadata wait — waitForLeaders can still race with produce.
-          const names = topics.map((t) => t.topic);
-          const deadline = Date.now() + 15_000;
-          while (Date.now() < deadline) {
-            const meta = await admin.fetchTopicMetadata({ topics: names });
-            const ready = names.every((n) =>
-              meta.topics.some((t: any) => t.name === n && !t.error && t.partitions?.length),
-            );
-            if (ready) break;
-            await Bun.sleep(100);
-          }
-        } finally {
-          await admin.disconnect();
-        }
+        await self.createTopicsAndWait(
+          queues.flatMap((q) => [self.topicForQueue(q), self.dlqTopic(q)]),
+        );
       },
       async publish(job: OutgoingJob): Promise<string> {
         const topic = self.topicForQueue(job.queue);
@@ -158,6 +212,7 @@ export class KafkaProvider implements BackstageProvider {
           meta: job.meta,
           deliveryCount: job.deliveryCount ?? 1,
         });
+        await self.ensureTopic(topic);
         const result = await self.producer.send({
           topic,
           acks: -1,
@@ -353,6 +408,7 @@ export class KafkaProvider implements BackstageProvider {
       name: 'kafka',
       async publish(topic: string, payload: unknown): Promise<string> {
         const t = `${self.prefix}.topic.${topic}`;
+        await self.ensureTopic(t);
         const result = await self.producer.send({
           topic: t,
           acks: -1,
@@ -382,6 +438,8 @@ export class KafkaProvider implements BackstageProvider {
         const group = opts.group
           ? `${self.prefix}.grp.${opts.group}`
           : `${self.prefix}.sub.${opts.consumerId}`;
+        await self.ensureTopic(topic);
+        if (opts.from !== 'earliest') await self.pinNewGroupToEnd(group, topic);
 
         const loop = (async () => {
           let backoff = 1000;
