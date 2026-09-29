@@ -581,7 +581,11 @@ func (p *RedisStreamsProvider) publishClaimed(ctx context.Context, jobs Jobs, ra
 		meta.Timeout = to
 	}
 	taskName, _ := task["taskName"].(string)
-	if _, err := jobs.Publish(ctx, OutgoingJob{Queue: queue, TaskName: taskName, Payload: payload, EnqueuedAt: enqueuedAt, Meta: meta}); err != nil {
+	dc := 1
+	if v, ok := asInt64(task["deliveryCount"]); ok && v > 0 {
+		dc = int(v)
+	}
+	if _, err := jobs.Publish(ctx, OutgoingJob{Queue: queue, TaskName: taskName, Payload: payload, EnqueuedAt: enqueuedAt, Meta: meta, DeliveryCount: dc}); err != nil {
 		return false
 	}
 	p.redis.ZRem(ctx, ScheduledClaimedKey(p.prefix), raw)

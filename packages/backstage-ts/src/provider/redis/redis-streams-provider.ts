@@ -501,6 +501,7 @@ export class RedisStreamsProvider implements BackstageProvider {
           enqueuedAt: job.enqueuedAt,
           streamKey: target,
           priority: job.queue,
+          deliveryCount: job.deliveryCount,
           attempts: job.meta.attempts,
           backoff: job.meta.backoff
             ? JSON.stringify(job.meta.backoff)
@@ -574,6 +575,7 @@ export class RedisStreamsProvider implements BackstageProvider {
         taskName: task.taskName,
         payload: JSON.parse(task.payload || 'null'),
         enqueuedAt: task.enqueuedAt ?? Date.now(),
+        deliveryCount: task.deliveryCount ?? 1,
         meta: {
           attempts: task.attempts,
           backoff: task.backoff ? JSON.parse(task.backoff) : undefined,

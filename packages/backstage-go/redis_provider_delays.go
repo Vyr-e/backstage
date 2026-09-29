@@ -23,6 +23,9 @@ func (d *redisDelays) Schedule(ctx context.Context, job OutgoingJob, runAt int64
 		"taskName": job.TaskName, "payload": payload, "enqueuedAt": job.EnqueuedAt,
 		"streamKey": target, "priority": job.Queue,
 	}
+	if job.DeliveryCount > 0 {
+		scheduledData["deliveryCount"] = job.DeliveryCount
+	}
 	if job.Meta.Attempts > 0 {
 		scheduledData["attempts"] = job.Meta.Attempts
 	}
