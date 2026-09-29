@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -74,13 +73,13 @@ func TestRabbitDeadLetterPublishFailureDoesNotAck(t *testing.T) {
 	}
 
 	// Stop rabbit so dead-letter publish cannot confirm
-	_ = exec.Command("sudo", "docker", "stop", "bs-rabbit").Run()
-	defer exec.Command("sudo", "docker", "start", "bs-rabbit").Run()
+	_ = dockerCtl("stop", "bs-rabbit")
+	defer dockerCtl("start", "bs-rabbit")
 	time.Sleep(2 * time.Second)
 
 	got := make(chan backstage.JobDelivery, 1)
 	// Reconnect will fail while stopped — start rabbit again for consume, then stop during DL
-	_ = exec.Command("sudo", "docker", "start", "bs-rabbit").Run()
+	_ = dockerCtl("start", "bs-rabbit")
 	time.Sleep(4 * time.Second)
 
 	sub, err := p.Jobs().Consume(ctx, backstage.ConsumeOptions{
@@ -103,7 +102,7 @@ func TestRabbitDeadLetterPublishFailureDoesNotAck(t *testing.T) {
 		t.Fatal("no delivery")
 	}
 
-	_ = exec.Command("sudo", "docker", "stop", "bs-rabbit").Run()
+	_ = dockerCtl("stop", "bs-rabbit")
 	time.Sleep(1 * time.Second)
 	err = d.DeadLetter(ctx, backstage.DeadLetterOpts{Error: "x"})
 	if err == nil {
@@ -111,7 +110,7 @@ func TestRabbitDeadLetterPublishFailureDoesNotAck(t *testing.T) {
 	}
 	_ = sub.Stop(ctx)
 	// Restart and ensure message is still available (not acked)
-	_ = exec.Command("sudo", "docker", "start", "bs-rabbit").Run()
+	_ = dockerCtl("start", "bs-rabbit")
 	time.Sleep(6 * time.Second)
 
 	got2 := make(chan struct{}, 1)
@@ -181,9 +180,9 @@ func TestRabbitReconnectAfterBrokerKill(t *testing.T) {
 		t.Fatal("first job missing")
 	}
 
-	_ = exec.Command("sudo", "docker", "stop", "bs-rabbit").Run()
+	_ = dockerCtl("stop", "bs-rabbit")
 	time.Sleep(2 * time.Second)
-	_ = exec.Command("sudo", "docker", "start", "bs-rabbit").Run()
+	_ = dockerCtl("start", "bs-rabbit")
 	time.Sleep(6 * time.Second)
 
 	_, err = p.Jobs().Publish(ctx, backstage.OutgoingJob{

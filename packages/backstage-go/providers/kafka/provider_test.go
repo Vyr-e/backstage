@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os/exec"
 	"testing"
 	"time"
 
@@ -132,9 +131,9 @@ func TestKafkaReconnectAfterBrokerKill(t *testing.T) {
 		t.Fatal("first job missing")
 	}
 
-	_ = exec.Command("sudo", "docker", "stop", "bs-kafka").Run()
+	_ = dockerCtl("stop", "bs-kafka")
 	time.Sleep(2 * time.Second)
-	_ = exec.Command("sudo", "docker", "start", "bs-kafka").Run()
+	_ = dockerCtl("start", "bs-kafka")
 	time.Sleep(12 * time.Second)
 
 	var pubErr error

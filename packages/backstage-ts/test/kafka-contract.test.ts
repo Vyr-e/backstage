@@ -2,6 +2,7 @@ import { describe, test, expect } from 'bun:test';
 import { KafkaProvider, ContiguousOffsetTracker } from '../src/provider/kafka';
 import { runProviderContract } from '../src/testing';
 import { RedisStreamsProvider } from '../src/provider/redis';
+import { dockerCtl } from './docker';
 
 async function assertKafkaUp(): Promise<void> {
   const { Kafka } = await import('kafkajs');
@@ -168,9 +169,9 @@ describe('Kafka production fixes', () => {
     while (!processed.includes('before') && Date.now() - t0 < 20_000) await Bun.sleep(100);
     expect(processed).toContain('before');
 
-    await Bun.$`sudo docker stop bs-kafka`.quiet();
+    await dockerCtl('stop', 'bs-kafka');
     await Bun.sleep(2000);
-    await Bun.$`sudo docker start bs-kafka`.quiet();
+    await dockerCtl('start', 'bs-kafka');
     await Bun.sleep(10000);
 
     let pubOk = false;

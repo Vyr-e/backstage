@@ -2,6 +2,7 @@ import { describe, test, expect } from 'bun:test';
 import { RabbitMQProvider } from '../src/provider/rabbitmq';
 import { runProviderContract } from '../src/testing';
 import { Worker } from '../src/worker';
+import { dockerCtl } from './docker';
 
 async function assertRabbitUp(): Promise<void> {
   const p = new RabbitMQProvider({
@@ -92,7 +93,7 @@ describe('RabbitMQ production fixes', () => {
     expect(delivery).not.toBeNull();
 
     // Kill broker then attempt deadLetter
-    await Bun.$`sudo docker stop bs-rabbit`.quiet();
+    await dockerCtl('stop', 'bs-rabbit');
     await Bun.sleep(1500);
     let failed = false;
     try {
@@ -102,7 +103,7 @@ describe('RabbitMQ production fixes', () => {
     }
     expect(failed).toBe(true);
 
-    await Bun.$`sudo docker start bs-rabbit`.quiet();
+    await dockerCtl('start', 'bs-rabbit');
     await Bun.sleep(6000);
     await sub.stop();
     await p.close();
@@ -162,9 +163,9 @@ describe('RabbitMQ production fixes', () => {
     while (!processed.includes('before') && Date.now() - t0 < 10_000) await Bun.sleep(100);
     expect(processed).toContain('before');
 
-    await Bun.$`sudo docker stop bs-rabbit`.quiet();
+    await dockerCtl('stop', 'bs-rabbit');
     await Bun.sleep(2000);
-    await Bun.$`sudo docker start bs-rabbit`.quiet();
+    await dockerCtl('start', 'bs-rabbit');
     await Bun.sleep(6000);
 
     let pubOk = false;
