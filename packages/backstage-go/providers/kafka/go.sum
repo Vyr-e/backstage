@@ -24,8 +24,8 @@ github.com/stretchr/objx v0.4.0/go.mod h1:YvHI0jy2hoMjB+UWwv71VJQ9isScKT/TqJzVSS
 github.com/stretchr/testify v1.7.1/go.mod h1:6Fq8oRcR53rry900zMqJjRRixrwX3KX962/h/Wwjteg=
 github.com/stretchr/testify v1.8.0 h1:pSgiaMZlXftHpm5L7V1+rVB+AZJydKsMxsQBIJw4PKk=
 github.com/stretchr/testify v1.8.0/go.mod h1:yNjHg4UonilssWZ8iaSj1OCr/vHnekPRkoO+kdMU+MU=
-github.com/vyr-e/backstage/packages/backstage-go v1.1.0 h1:Fr++1YLMx+BTUCcx1trcvbmqFS8peQ0ocL0fMCpHz8E=
-github.com/vyr-e/backstage/packages/backstage-go v1.1.0/go.mod h1:CvpaaKOhYuDbtb/WH1AcsAEusemJftb5chP8TVbx+2w=
+github.com/vyr-e/backstage/packages/backstage-go v1.1.1 h1:sIlXQlfihwZ7zlI2YX0EqYnjAbWJTBH8W+5GCD/2mm0=
+github.com/vyr-e/backstage/packages/backstage-go v1.1.1/go.mod h1:CvpaaKOhYuDbtb/WH1AcsAEusemJftb5chP8TVbx+2w=
 github.com/xdg-go/pbkdf2 v1.0.0 h1:Su7DPu48wXMwC3bs7MCNG+z4FhcyEuz5dlvchbq0B0c=
 github.com/xdg-go/pbkdf2 v1.0.0/go.mod h1:jrpuAogTd400dnrH08LKmI/xc1MbPOebTwRqcT5RDeI=
 github.com/xdg-go/scram v1.1.2 h1:FHX5I5B4i4hKRVRBCFRxq1iQRej7WO3hhBuJf+UUySY=

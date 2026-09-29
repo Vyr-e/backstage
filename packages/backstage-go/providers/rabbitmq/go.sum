@@ -10,7 +10,7 @@ github.com/rabbitmq/amqp091-go v1.10.0 h1:STpn5XsHlHGcecLmMFCtg7mqq0RnD+zFr4uzuk
 github.com/rabbitmq/amqp091-go v1.10.0/go.mod h1:Hy4jKW5kQART1u+JkDTF9YYOQUHXqMuhrgxOEeS7G4o=
 github.com/redis/go-redis/v9 v9.17.2 h1:P2EGsA4qVIM3Pp+aPocCJ7DguDHhqrXNhVcEp4ViluI=
 github.com/redis/go-redis/v9 v9.17.2/go.mod h1:u410H11HMLoB+TP67dz8rL9s6QW2j76l0//kSOd3370=
-github.com/vyr-e/backstage/packages/backstage-go v1.1.0 h1:Fr++1YLMx+BTUCcx1trcvbmqFS8peQ0ocL0fMCpHz8E=
-github.com/vyr-e/backstage/packages/backstage-go v1.1.0/go.mod h1:CvpaaKOhYuDbtb/WH1AcsAEusemJftb5chP8TVbx+2w=
+github.com/vyr-e/backstage/packages/backstage-go v1.1.1 h1:sIlXQlfihwZ7zlI2YX0EqYnjAbWJTBH8W+5GCD/2mm0=
+github.com/vyr-e/backstage/packages/backstage-go v1.1.1/go.mod h1:CvpaaKOhYuDbtb/WH1AcsAEusemJftb5chP8TVbx+2w=
 go.uber.org/goleak v1.3.0 h1:2K3zAYmnTNqV73imy9J1T3WC+gmCePx2hEGkimedGto=
 go.uber.org/goleak v1.3.0/go.mod h1:CoHD4mav9JJNrW/WLlf7HGZPjdw8EucARQHekz1X6bE=
