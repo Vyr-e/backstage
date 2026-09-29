@@ -3,11 +3,11 @@
  */
 
 import {
-  BROADCAST_STREAM,
   type StreamMessage,
   type RedisClient,
   parseFields,
 } from './types';
+import { broadcastStreamKey, broadcastGroup, STREAM_PREFIX } from './wire';
 import { Logger, createLogger, LogLevel, type LoggerConfig } from './logger';
 import type { Worker } from './worker';
 
@@ -41,6 +41,7 @@ export class Broadcast {
   private redis: RedisClient;
   private workerId: string;
   private consumerGroup: string;
+  private streamKey: string;
   private logger: Logger;
   private consumerIdleThreshold: number;
   private startPosition: 'latest' | 'beginning';
@@ -64,7 +65,8 @@ export class Broadcast {
       );
     }
 
-    this.consumerGroup = `broadcast-${this.workerId}`;
+    this.consumerGroup = broadcastGroup(this.workerId);
+    this.streamKey = broadcastStreamKey(STREAM_PREFIX);
     this.consumerIdleThreshold = config.consumerIdleThreshold ?? 60 * 60 * 1000; // 1 hour
     this.startPosition = config.startPosition ?? 'latest';
     this.logger = createLogger({
@@ -83,7 +85,7 @@ export class Broadcast {
     try {
       await this.redis.send('XGROUP', [
         'CREATE',
-        BROADCAST_STREAM,
+        this.streamKey,
         this.consumerGroup,
         this.startPosition === 'beginning' ? '0' : '$',
         'MKSTREAM',
@@ -105,7 +107,7 @@ export class Broadcast {
    */
   async send(taskName: string, payload: unknown): Promise<string> {
     const messageId = await this.redis.send('XADD', [
-      BROADCAST_STREAM,
+      this.streamKey,
       '*',
       'taskName',
       taskName,
@@ -137,7 +139,7 @@ export class Broadcast {
         'BLOCK',
         String(blockMs),
         'STREAMS',
-        BROADCAST_STREAM,
+        this.streamKey,
         '>',
       ]);
 
@@ -182,7 +184,7 @@ export class Broadcast {
    */
   async ack(messageId: string): Promise<void> {
     await this.redis.send('XACK', [
-      BROADCAST_STREAM,
+      this.streamKey,
       this.consumerGroup,
       messageId,
     ]);
@@ -216,7 +218,7 @@ export class Broadcast {
     try {
       const groups = await this.redis.send('XINFO', [
         'GROUPS',
-        BROADCAST_STREAM,
+        this.streamKey,
       ]);
       if (!groups || !Array.isArray(groups)) return deleted;
 
@@ -232,7 +234,7 @@ export class Broadcast {
         if (shouldDelete) {
           await this.redis.send('XGROUP', [
             'DESTROY',
-            BROADCAST_STREAM,
+            this.streamKey,
             groupName,
           ]);
           this.logger.info(`Deleted stale consumer group: ${groupName}`);
@@ -253,7 +255,7 @@ export class Broadcast {
     try {
       const consumers = await this.redis.send('XINFO', [
         'CONSUMERS',
-        BROADCAST_STREAM,
+        this.streamKey,
         groupName,
       ]);
 

@@ -4,9 +4,14 @@
 
 import type { CronTask } from './cron';
 import type { Queue } from './queue';
-import type { RedisClient } from './types';
 import { Logger, LogLevel, createLogger } from './logger';
-import { serialize } from './serializer';
+import {
+  resolveCapabilities,
+  type BackstageProvider,
+  type CapabilityOverrides,
+  type ResolvedCapabilities,
+} from './provider';
+import { RedisStreamsProvider } from './provider/redis';
 
 export interface SchedulerConfig {
   host?: string;
@@ -17,11 +22,14 @@ export interface SchedulerConfig {
   queues?: Queue[];
   logLevel?: LogLevel;
   logFile?: string;
+  /** Optional transport provider (default: Redis via host/port). */
+  provider?: BackstageProvider;
+  capabilities?: CapabilityOverrides;
 }
 
 /**
  * Scheduler for generating periodic tasks based on cron expressions.
- * Enqueues tasks to Redis Streams when their schedule is due.
+ * Enqueues tasks through the jobs capability when their schedule is due.
  *
  * @example
  * ```typescript
@@ -35,17 +43,15 @@ export interface SchedulerConfig {
  */
 export class Scheduler {
   private config: SchedulerConfig;
-  private redis: RedisClient;
   private schedules: CronTask[];
   private queues: Map<string, Queue>;
   private logger: Logger;
   private running = false;
+  private provider: BackstageProvider;
+  private resolved: ResolvedCapabilities;
+  private providerReady: Promise<void>;
+  private ownsProvider: boolean;
 
-  /**
-   * Create a new Scheduler instance.
-   *
-   * @param config - Configuration options including schedules and connection details
-   */
   constructor(config: SchedulerConfig = {}) {
     this.config = config;
     this.schedules = config.schedules ?? [];
@@ -61,20 +67,29 @@ export class Scheduler {
       isScheduler: true,
     });
 
-    const redisUrl = this.buildRedisUrl();
-    this.redis = new Bun.RedisClient(redisUrl);
-  }
-
-  private buildRedisUrl(): string {
-    const host = this.config.host ?? 'localhost';
-    const port = this.config.port ?? 6379;
-    const password = this.config.password;
-    const db = this.config.db ?? 0;
-
-    if (password) {
-      return `redis://:${password}@${host}:${port}/${db}`;
+    if (config.provider) {
+      this.provider = config.provider;
+      this.ownsProvider = false;
+    } else {
+      this.provider = new RedisStreamsProvider({
+        host: config.host,
+        port: config.port,
+        password: config.password,
+        db: config.db,
+      });
+      this.ownsProvider = true;
     }
-    return `redis://${host}:${port}/${db}`;
+
+    this.resolved = resolveCapabilities(this.provider, config.capabilities);
+    this.providerReady = (this.provider.init
+      ? this.provider.init({
+          capabilities: this.resolved,
+          logger: this.logger,
+        })
+      : Promise.resolve()
+    ).then(() => {
+      this.resolved = resolveCapabilities(this.provider, config.capabilities);
+    });
   }
 
   /**
@@ -87,6 +102,8 @@ export class Scheduler {
       return;
     }
 
+    await this.providerReady;
+
     this.logger.info(`Starting scheduler with ${this.schedules.length} tasks`);
     this.running = true;
 
@@ -98,26 +115,22 @@ export class Scheduler {
     while (this.running) {
       const now = new Date();
 
-      // Enqueue tasks that are due
       for (const cronTask of upcomingTasks) {
         await this.enqueueTask(cronTask);
         cronTask.markRun(now);
       }
 
-      // Calculate next run times
       const nextRuns = this.schedules.map((task) => ({
         task,
         next: task.getNextRun(now),
         delay: task.getNextRun(now).getTime() - now.getTime(),
       }));
 
-      // Find the soonest task(s)
       const minDelay = Math.min(...nextRuns.map((r) => r.delay));
       upcomingTasks = nextRuns
         .filter((r) => r.delay <= minDelay + 1000)
         .map((r) => r.task);
 
-      // Sleep until next task
       const sleepMs = Math.max(minDelay, 1000);
       this.logger.debug(
         `Sleeping ${Math.round(sleepMs / 1000)}s until next task`,
@@ -134,27 +147,26 @@ export class Scheduler {
    */
   stop(): void {
     this.running = false;
+    if (this.ownsProvider) {
+      void this.provider.close();
+    }
   }
 
   private async enqueueTask(cronTask: CronTask): Promise<void> {
     const queue = cronTask.queue ?? this.getDefaultQueue();
-    const streamKey = queue?.streamKey ?? 'backstage:default';
+    const queueName = queue?.name ?? 'default';
 
-    const payload = serialize({
+    // Preserve historical cron payload shape: { taskName, args }
+    await this.resolved.jobs.publish({
+      queue: queueName,
       taskName: cronTask.taskName,
-      args: cronTask.args,
+      payload: {
+        taskName: cronTask.taskName,
+        args: cronTask.args,
+      },
+      enqueuedAt: Date.now(),
+      meta: {},
     });
-
-    await this.redis.send('XADD', [
-      streamKey,
-      '*',
-      'taskName',
-      cronTask.taskName,
-      'payload',
-      payload,
-      'enqueuedAt',
-      String(Date.now()),
-    ]);
 
     this.logger.info(`Enqueued scheduled task: ${cronTask.taskName}`);
   }

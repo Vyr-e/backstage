@@ -4,7 +4,6 @@ package backstage
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -19,12 +18,15 @@ import (
 // It also handles moving delayed/scheduled tasks from the ZSET to the active stream
 // when they become ready for processing.
 type Scheduler struct {
-	redis     *redis.Client
-	schedules []*CronTask
-	queues    map[string]*Queue
-	logger    *Logger
-	running   bool
-	prefix    string
+	redis         *redis.Client
+	schedules     []*CronTask
+	queues        map[string]*Queue
+	logger        *Logger
+	running       bool
+	prefix        string
+	provider      Provider
+	resolved      ResolvedCapabilities
+	redisProvider *RedisStreamsProvider
 }
 
 // SchedulerConfig configuration for the Scheduler.
@@ -41,6 +43,8 @@ type SchedulerConfig struct {
 	Silent          bool
 	Prefix          string // Stream key prefix (default: "backstage")
 	DefaultPriority string // Default priority name (default: "default")
+	Provider        Provider
+	Capabilities    *Capabilities
 }
 
 // Lua script for atomic scheduled task processing
@@ -75,30 +79,52 @@ return processed
 `
 
 func NewScheduler(cfg SchedulerConfig) *Scheduler {
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
-		Password: cfg.Password,
-		DB:       cfg.DB,
-	})
-
 	prefix := cfg.Prefix
 	if prefix == "" {
 		prefix = StreamPrefix
 	}
-
 	queues := make(map[string]*Queue)
 	for _, q := range cfg.Queues {
 		q.Prefix = prefix
 		queues[q.Name] = q
 	}
 
-	return &Scheduler{
-		redis:     rdb,
+	s := &Scheduler{
 		schedules: cfg.Schedules,
 		queues:    queues,
 		logger:    NewLogger("Scheduler", LoggerConfig{Level: cfg.LogLevel, Silent: cfg.Silent}),
 		prefix:    prefix,
 	}
+
+	if cfg.Provider != nil {
+		s.provider = cfg.Provider
+		if rp, ok := cfg.Provider.(*RedisStreamsProvider); ok {
+			s.redisProvider = rp
+			s.redis = rp.Redis()
+		}
+	} else {
+		rp := NewRedisStreamsProvider(RedisStreamsProviderConfig{
+			Host: cfg.Host, Port: cfg.Port, Password: cfg.Password, DB: cfg.DB, Prefix: prefix,
+		})
+		s.provider = rp
+		s.redisProvider = rp
+		s.redis = rp.Redis()
+	}
+	resolved, err := ResolveCapabilities(s.provider, cfg.Capabilities)
+	if err != nil {
+		s.resolved = ResolvedCapabilities{}
+		return s
+	}
+	s.resolved = resolved
+	if initErr := s.provider.Init(context.Background(), ProviderContext{Capabilities: resolved, Logger: s.logger}); initErr != nil {
+		s.logger.Error("provider init failed", "error", initErr)
+		return s
+	}
+	resolved, err = ResolveCapabilities(s.provider, cfg.Capabilities)
+	if err == nil {
+		s.resolved = resolved
+	}
+	return s
 }
 
 // Start runs the scheduler loop.
@@ -167,20 +193,18 @@ func (s *Scheduler) Stop() {
 }
 
 func (s *Scheduler) enqueueTask(ctx context.Context, task *CronTask) {
-	streamKey := s.prefix + ":default"
+	queueName := "default"
 	if task.Queue != nil {
-		streamKey = task.Queue.StreamKey()
+		queueName = task.Queue.Name
 	}
-
-	s.redis.XAdd(ctx, &redis.XAddArgs{
-		Stream: streamKey,
-		Values: map[string]interface{}{
-			"taskName":   task.TaskName,
-			"payload":    "{}",
-			"enqueuedAt": time.Now().UnixMilli(),
-		},
+	_, err := s.resolved.Jobs.Publish(ctx, OutgoingJob{
+		Queue: queueName, TaskName: task.TaskName, Payload: map[string]interface{}{},
+		EnqueuedAt: time.Now().UnixMilli(),
 	})
-
+	if err != nil {
+		s.logger.Error("Failed to enqueue scheduled task", "task", task.TaskName, "error", err)
+		return
+	}
 	s.logger.Info("Enqueued scheduled task", "task", task.TaskName)
 }
 
@@ -189,23 +213,20 @@ func (s *Scheduler) enqueueTask(ctx context.Context, task *CronTask) {
 // Uses a Lua script to identify tasks with score <= now, moves them to their
 // target stream, and removes them from the ZSET in one atomic operation.
 func (s *Scheduler) ProcessScheduledTasks(ctx context.Context, defaultPriority string) (int64, error) {
-	scheduledKey := s.prefix + ":scheduled"
+	if s.redisProvider != nil {
+		return s.redisProvider.PromoteCrossProvider(ctx)
+	}
+	scheduledKey := ScheduledKey(s.prefix)
 	now := time.Now().UnixMilli()
-
 	if defaultPriority == "" {
 		defaultPriority = "default"
 	}
-
-	result, err := s.redis.Eval(ctx, processScheduledLua, []string{scheduledKey},
-		now,
-		s.prefix,
-		defaultPriority,
+	result, err := s.redis.Eval(ctx, ProcessScheduledLua, []string{scheduledKey},
+		now, s.prefix, defaultPriority,
 	).Result()
-
 	if err != nil {
 		return 0, err
 	}
-
 	count, _ := result.(int64)
 	return count, nil
 }

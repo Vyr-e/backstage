@@ -2,149 +2,165 @@
  * Backstage SDK - Worker
  */
 
-import { Stream } from './stream';
-import { Queue } from './queue';
-import { Reclaimer } from './reclaimer';
-import { SoftTimeout, HardTimeout } from './exceptions';
+import { computeBackoff } from './compute-backoff';
+import { HardTimeout } from './exceptions';
 import { Logger, createLogger, LogLevel, type LoggerConfig } from './logger';
+import {
+  buildCapabilityReport,
+  formatCapabilityReport,
+  requireCapability,
+  resolveCapabilities,
+  type BackstageProvider,
+  type CapabilityOverrides,
+  type CapabilityReport,
+  type JobDelivery,
+  type ResolvedCapabilities,
+  type Subscription,
+} from './provider';
+import { RedisStreamsProvider } from './provider/redis';
+import { Queue } from './queue';
 import { ScriptRegistry } from './script-registry';
 import {
   Priority,
-  getDeadLetterKey,
   getDefaultWorkerId,
-  parseFields,
   type RedisClient,
   type WorkerConfig,
   type TaskConfig,
   type TaskHandler,
-  type StreamMessage,
   type WorkflowInstruction,
   type EnqueueOptions,
   DEFAULT_WORKER_CONFIG,
 } from './types';
 
+export interface WorkerOptions extends WorkerConfig {
+  provider?: BackstageProvider;
+  capabilities?: CapabilityOverrides;
+}
+
+type TopicHandler = (
+  payload: unknown,
+  msg: { id: string; topic: string; publishedAt: number },
+) => Promise<void>;
+
+interface PendingTopicSub {
+  topic: string;
+  handler: TopicHandler;
+  group?: string;
+  from: 'latest' | 'earliest';
+}
+
 /**
- * Main Worker class that processes tasks from Redis Streams.
- *
- * @example
- * ```typescript
- * const worker = new Worker({
- *   host: 'localhost',
- *   consumerGroup: 'my-app'
- * });
- *
- * worker.on('send-email', async (job) => {
- *   await sendEmail(job.to, job.body);
- * });
- *
- * await worker.start();
- * ```
+ * Main Worker — orchestration over a transport provider.
+ * Default provider is Redis Streams (same wire format as before).
  */
 export class Worker {
   private config: Required<WorkerConfig>;
-  private _redis: RedisClient;
-  private stream: Stream;
-  private reclaimer: Reclaimer;
   private logger: Logger;
-
-  /**
-   * Registry for managing and running Lua scripts.
-   */
-  public scripts: ScriptRegistry;
+  private provider: BackstageProvider;
+  private resolved: ResolvedCapabilities;
+  private overrides?: CapabilityOverrides;
+  private redisProvider: RedisStreamsProvider | null;
 
   private tasks: Map<string, TaskConfig> = new Map();
-  private running: boolean = false;
+  private running = false;
   private activeTasks: Set<Promise<void>> = new Set();
   private registeredQueues: Set<string> = new Set();
-  private reclaimerInterval: Timer | null = null;
-  private schedulerInterval: Timer | null = null;
-  private ackFlushInterval: Timer | null = null;
+  private jobSubscription: Subscription | null = null;
+  private topicSubscriptions: Subscription[] = [];
+  private pendingTopicSubs: PendingTopicSub[] = [];
+  private promoteTimer: Timer | null = null;
+  private providerReady: Promise<void>;
+  private stopResolve: (() => void) | null = null;
+  private startDone: Promise<void> | null = null;
 
-  // Batched ACK queues: streamKey -> messageIds[]
-  private pendingAcks: Map<string, string[]> = new Map();
-  private readonly ACK_BATCH_SIZE = 100;
-  private readonly ACK_FLUSH_INTERVAL = 50; // ms
-
-  /**
-   * Redis client used by this worker.
-   */
   get redis(): RedisClient {
-    return this._redis;
+    if (!this.redisProvider) {
+      throw new Error(
+        'worker.redis is only available when using RedisStreamsProvider',
+      );
+    }
+    return this.redisProvider.redis;
   }
 
-  /**
-   * Unique identifier for this worker instance.
-   */
+  get scripts(): ScriptRegistry {
+    if (!this.redisProvider) {
+      throw new Error(
+        'worker.scripts is only available when using RedisStreamsProvider',
+      );
+    }
+    return this.redisProvider.scripts;
+  }
+
   get workerId(): string {
     return this.config.workerId;
   }
 
-  /**
-   * Create a new Worker instance.
-   *
-   * @param config Worker configuration options
-   * @param loggerConfig Optional logger configuration
-   */
-  constructor(config: WorkerConfig = {}, loggerConfig?: LoggerConfig) {
+  constructor(config: WorkerOptions = {}, loggerConfig?: LoggerConfig) {
     const workerId = config.workerId || getDefaultWorkerId();
+    const { provider: injected, capabilities: overrides, ...rest } = config;
     this.config = {
       ...DEFAULT_WORKER_CONFIG,
-      ...config,
+      ...rest,
       workerId,
     };
-
-    const redisUrl = this.buildRedisUrl();
-    this._redis = new Bun.RedisClient(redisUrl);
-
-    this.stream = new Stream(this._redis, this.config.consumerGroup, {
-      queues: this.config.queues,
+    this.overrides = overrides;
+    this.logger = createLogger({
+      level: LogLevel.INFO,
+      ...loggerConfig,
     });
 
-    // Track explicitly configured queues
+    if (injected) {
+      this.provider = injected;
+      this.redisProvider =
+        injected instanceof RedisStreamsProvider ? injected : null;
+    } else {
+      const redisProvider = new RedisStreamsProvider({
+        host: this.config.host,
+        port: this.config.port,
+        password: this.config.password,
+        db: this.config.db,
+        deleteOnAck: this.config.deleteOnAck,
+        blockTimeout: this.config.blockTimeout,
+        reclaimIntervalMs: this.config.reclaimerInterval,
+        idleTimeoutMs: this.config.idleTimeout,
+        maxDeliveries: this.config.maxDeliveries,
+      });
+      this.provider = redisProvider;
+      this.redisProvider = redisProvider;
+    }
+
+    this.resolved = resolveCapabilities(this.provider, this.overrides);
+
     if (this.config.queues) {
       for (const q of this.config.queues) {
         this.registeredQueues.add(q.name);
       }
     }
 
-    this.reclaimer = new Reclaimer(
-      this._redis,
-      this.config.consumerGroup,
-      this.config.workerId,
-      this.config.idleTimeout,
-      this.config.maxDeliveries,
-    );
-    this.scripts = new ScriptRegistry(this._redis);
-
-    this.logger = createLogger({
-      level: LogLevel.INFO,
-      ...loggerConfig,
-    });
+    this.providerReady = this.bootProvider();
   }
 
-  private buildRedisUrl(): string {
-    const { host, port, password, db } = this.config;
-    if (password) {
-      return `redis://:${password}@${host}:${port}/${db}`;
+  private async bootProvider(): Promise<void> {
+    if (this.provider.init) {
+      await this.provider.init({
+        capabilities: this.resolved,
+        logger: this.logger,
+      });
     }
-    return `redis://${host}:${port}/${db}`;
+    // Re-resolve after init so providers that discover capabilities during init
+    // (e.g. RabbitMQ delayed-message plugin) pass start() checks.
+    this.resolved = resolveCapabilities(this.provider, this.overrides);
   }
 
-  /**
-   * Register a handler for a task.
-   *
-   * @param taskName - Unique name of the task
-   * @param handler - Function to execute when task is received
-   * @param options - Task-specific configuration (priority, retries, etc.)
-   * @returns This worker instance for chaining
-   *
-   * @example
-   * ```typescript
-   * worker.on('resize-image', async (payload) => {
-   *   await resize(payload.src, payload.width);
-   * }, { priority: Priority.URGENT });
-   * ```
-   */
+  capabilities(): CapabilityReport {
+    return buildCapabilityReport(
+      this.provider.name,
+      this.provider,
+      this.resolved,
+      this.overrides,
+    );
+  }
+
   on<T = unknown>(
     taskName: string,
     handler: TaskHandler<T>,
@@ -156,11 +172,6 @@ export class Worker {
 
     if (options.queue && !this.registeredQueues.has(options.queue)) {
       this.registeredQueues.add(options.queue);
-      this.stream.addQueue(new Queue(options.queue)).catch((err) => {
-        this.logger.error(`Failed to register queue '${options.queue}'`, {
-          error: String(err),
-        });
-      });
     }
 
     this.tasks.set(taskName, {
@@ -177,130 +188,176 @@ export class Worker {
     return this;
   }
 
-  /**
-   * Enqueue a task for immediate processing.
-   *
-   * @param taskName - Name of the task to enqueue
-   * @param payload - Data to pass to the task handler
-   * @param options - Enqueue options (priority, dedupe, etc.)
-   * @returns The Redis Stream message ID
-   *
-   * @example
-   * ```typescript
-   * await worker.enqueue('send-email', {
-   *   to: 'user@example.com',
-   *   subject: 'Welcome'
-   * });
-   * ```
-   */
   async enqueue(
     taskName: string,
     payload: unknown,
     options: EnqueueOptions = {},
   ): Promise<string | null> {
-    return this.stream.enqueue(taskName, payload, options);
+    await this.providerReady;
+
+    if (options.dedupe) {
+      const dedupe = requireCapability(
+        this.provider.name,
+        this.resolved,
+        'dedupe',
+      );
+      const claimed = await dedupe.claim(
+        options.dedupe.key,
+        options.dedupe.ttl ?? 3_600_000,
+      );
+      if (!claimed) return null;
+    }
+
+    const queue = options.queue ?? options.priority ?? Priority.DEFAULT;
+    const job = {
+      queue,
+      taskName,
+      payload,
+      enqueuedAt: Date.now(),
+      meta: {
+        attempts: options.attempts,
+        backoff: options.backoff,
+        timeout: options.timeout,
+      },
+    };
+
+    if (options.delay && options.delay > 0) {
+      const delays = requireCapability(
+        this.provider.name,
+        this.resolved,
+        'delays',
+      );
+      return delays.schedule(job, Date.now() + options.delay);
+    }
+
+    return this.resolved.jobs.publish(job);
   }
 
-  /**
-   * Schedule a task to run after a delay.
-   *
-   * @param taskName - Name of the task to schedule
-   * @param payload - Data to pass to the task handler
-   * @param delayMs - Delay in milliseconds
-   * @param options - Enqueue options (excluding delay)
-   * @returns The scheduled task ID
-   *
-   * @example
-   * ```typescript
-   * // Run execution in 1 hour
-   * await worker.schedule('cleanup-logs', {}, 3600 * 1000);
-   * ```
-   */
   async schedule(
     taskName: string,
     payload: unknown,
     delayMs: number,
-    options: Omit<EnqueueOptions, 'delay'> = {},
+    options: EnqueueOptions = {},
   ): Promise<string | null> {
-    return this.stream.enqueue(taskName, payload, {
-      ...options,
-      delay: delayMs,
-    });
+    return this.enqueue(taskName, payload, { ...options, delay: delayMs });
+  }
+
+  async publish(topic: string, payload: unknown): Promise<string> {
+    await this.providerReady;
+    const topics = requireCapability(
+      this.provider.name,
+      this.resolved,
+      'topics',
+    );
+    return topics.publish(topic, payload);
+  }
+
+  subscribe(
+    topic: string,
+    handler: TopicHandler,
+    options: { group?: string; from?: 'latest' | 'earliest' } = {},
+  ): this {
+    const sub: PendingTopicSub = {
+      topic,
+      handler,
+      group: options.group,
+      from: options.from ?? 'latest',
+    };
+    this.pendingTopicSubs.push(sub);
+    if (this.running) {
+      this.startTopicSub(sub).catch((err) => {
+        this.logger.error('Failed to start topic subscription', {
+          error: String(err),
+        });
+      });
+    }
+    return this;
   }
 
   /**
-   * Start the worker.
-   * Connects to Redis, initializes streams, and begins the processing loop.
+   * Start the worker. Blocks until stop() is called (master behavior).
+   * A second concurrent start() throws.
    */
   async start(): Promise<void> {
     if (this.running) {
       throw new Error('Worker is already running');
     }
 
-    this.logger.info(`Starting worker: ${this.config.workerId}`);
-    this.logger.info(`Consumer group: ${this.config.consumerGroup}`);
-    this.logger.info(`Registered tasks: ${this.tasks.size}`);
+    await this.providerReady;
 
-    await this.stream.initialize();
-    await this.reclaimer.initialize(this.stream.getStreamKeys());
+    if (this.pendingTopicSubs.length > 0) {
+      requireCapability(this.provider.name, this.resolved, 'topics');
+    }
+    for (const req of this.resolved.jobs.requires ?? []) {
+      requireCapability(this.provider.name, this.resolved, req);
+    }
 
     this.running = true;
+    this.logger.info(`Worker starting: ${this.config.workerId}`);
+    this.logger.info(`\n${formatCapabilityReport(this.capabilities())}`);
+
+    const queues = this.getQueueNames();
+    await this.resolved.jobs.ensureQueues(queues);
+
+    this.jobSubscription = await this.resolved.jobs.consume(
+      {
+        queues,
+        group: this.config.consumerGroup,
+        consumerId: this.config.workerId,
+        prefetch: Math.max(this.config.prefetch, this.config.concurrency),
+        idleTimeout: this.config.idleTimeout,
+      },
+      (d) => this.onJobDelivery(d),
+    );
+
+    for (const sub of this.pendingTopicSubs) {
+      await this.startTopicSub(sub);
+    }
+
+    // One promote loop in the worker only (not in producers / provider.schedule)
+    if (this.resolved.delays && this.redisProvider) {
+      this.promoteTimer = setInterval(() => {
+        this.redisProvider!.promoteCrossProvider().catch(() => {});
+      }, 1000);
+    }
+
     this.setupSignalHandlers();
+    this.logger.info('Worker started');
 
-    this.reclaimerInterval = setInterval(
-      () => this.runReclaimer(),
-      this.config.reclaimerInterval,
-    );
-
-    this.schedulerInterval = setInterval(
-      () => this.stream.processScheduledTasks(),
-      1000,
-    );
-
-    // Start batched ACK flushing
-    this.ackFlushInterval = setInterval(
-      () => this.flushAcks(),
-      this.ACK_FLUSH_INTERVAL,
-    );
-
-    await this.processLoop();
+    this.startDone = new Promise<void>((resolve) => {
+      this.stopResolve = resolve;
+    });
+    await this.startDone;
   }
 
-  /**
-   * Stop the worker gracefully.
-   * Stops accepting new tasks and waits for active tasks to complete within the grace period.
-   */
   async stop(): Promise<void> {
     if (!this.running) return;
-
-    this.logger.info('Stopping worker...');
+    this.logger.info('Worker stopping...');
     this.running = false;
 
-    if (this.reclaimerInterval) {
-      clearInterval(this.reclaimerInterval);
-      this.reclaimerInterval = null;
-    }
-    if (this.schedulerInterval) {
-      clearInterval(this.schedulerInterval);
-      this.schedulerInterval = null;
-    }
-    if (this.ackFlushInterval) {
-      clearInterval(this.ackFlushInterval);
-      this.ackFlushInterval = null;
+    if (this.promoteTimer) {
+      clearInterval(this.promoteTimer);
+      this.promoteTimer = null;
     }
 
-    // Flush any remaining ACKs
-    await this.flushAcks();
+    // Stop subscriptions without waiting on in-flight handlers indefinitely.
+    if (this.jobSubscription) {
+      await this.jobSubscription.stop();
+      this.jobSubscription = null;
+    }
+    for (const s of this.topicSubscriptions) {
+      await s.stop();
+    }
+    this.topicSubscriptions = [];
 
     if (this.activeTasks.size > 0) {
-      this.logger.info(`Waiting for ${this.activeTasks.size} active tasks...`);
-
-      const gracePeriodPromise = new Promise<void>((resolve) =>
-        setTimeout(resolve, this.config.gracePeriod),
+      this.logger.info(
+        `Waiting for ${this.activeTasks.size} active tasks (grace: ${this.config.gracePeriod}ms)`,
       );
-
-      await Promise.race([Promise.all(this.activeTasks), gracePeriodPromise]);
-
+      await Promise.race([
+        Promise.all(this.activeTasks),
+        Bun.sleep(this.config.gracePeriod),
+      ]);
       if (this.activeTasks.size > 0) {
         this.logger.warn(
           `Force exiting with ${this.activeTasks.size} unfinished tasks`,
@@ -308,311 +365,144 @@ export class Worker {
       }
     }
 
+    await this.provider.close();
     this.logger.info('Worker stopped');
+
+    const resolve = this.stopResolve;
+    this.stopResolve = null;
+    this.startDone = null;
+    resolve?.();
   }
 
-  private async processLoop(): Promise<void> {
-    const streamKeys = this.stream.getStreamKeys();
+  private async startTopicSub(sub: PendingTopicSub): Promise<void> {
+    const topics = requireCapability(
+      this.provider.name,
+      this.resolved,
+      'topics',
+    );
+    const subscription = await topics.subscribe(
+      {
+        topic: sub.topic,
+        group: sub.group,
+        consumerId: this.config.workerId,
+        from: sub.from,
+      },
+      async (m) => {
+        await sub.handler(m.payload, {
+          id: m.id,
+          topic: m.topic,
+          publishedAt: m.publishedAt,
+        });
+      },
+    );
+    this.topicSubscriptions.push(subscription);
+  }
 
-    // For high throughput, prefetch up to concurrency level
-    const prefetch = Math.max(this.config.prefetch, this.config.concurrency);
-
-    // Use '>' to read new (undelivered) messages
-    // The consumer group's start ID (set to '0' at creation) determines
-    // which messages are considered "new" - all messages from stream start
-    const streamIds = streamKeys.map(() => '>');
-
-    // Track if we got messages last iteration (for BLOCK vs NOBLOCK decision)
-    let gotMessagesLastTime = false;
-
-    while (this.running) {
-      try {
-        // Backpressure: wait if at concurrency limit
-        if (this.activeTasks.size >= this.config.concurrency) {
-          await Promise.race(this.activeTasks);
-          continue;
-        }
-
-        // Calculate how many to fetch based on remaining capacity
-        const available = this.config.concurrency - this.activeTasks.size;
-        const count = Math.min(prefetch, available);
-
-        // Build XREADGROUP command
-        // Use NOBLOCK when actively processing for max throughput
-        // Only BLOCK when idle (no messages last time) to save CPU
-        const xreadArgs: string[] = [
-          'GROUP',
-          this.config.consumerGroup,
-          this.config.workerId,
-          'COUNT',
-          String(count),
-        ];
-
-        if (!gotMessagesLastTime) {
-          // Idle - block and wait for messages
-          xreadArgs.push('BLOCK', String(this.config.blockTimeout));
-        }
-        // else: NOBLOCK - return immediately if no messages
-
-        xreadArgs.push('STREAMS', ...streamKeys, ...streamIds);
-
-        const result = await this._redis.send('XREADGROUP', xreadArgs);
-
-        // Bun's Redis client returns results in object format: {streamKey: [[msgId, fields], ...]}
-        // Standard Redis returns: [[streamKey, [[msgId, fields], ...]]]
-        // Handle both formats for compatibility
-        if (!result || typeof result !== 'object') {
-          gotMessagesLastTime = false;
-          continue;
-        }
-
-        gotMessagesLastTime = true;
-
-        // Handle Bun's object format: {streamKey: messages[]}
-        const entries = Array.isArray(result)
-          ? (result as [string, unknown[]][]) // Standard format
-          : (Object.entries(result) as [string, unknown[]][]); // Bun object format
-
-        for (const [streamKey, messages] of entries) {
-          if (!Array.isArray(messages) || messages.length === 0) continue;
-
-          for (const msgEntry of messages) {
-            if (!Array.isArray(msgEntry) || msgEntry.length < 2) continue;
-
-            const [msgId, fields] = msgEntry as [string, unknown[]];
-            const message = this.parseMessage(msgId, fields);
-            if (message) {
-              // Fire and forget - adds to activeTasks and starts execution
-              this.handleMessage(streamKey, message);
-            }
-          }
-        }
-      } catch (err) {
-        if (this.running) {
-          const errorMsg = err instanceof Error ? err.message : String(err);
-          const stack = err instanceof Error ? err.stack : undefined;
-          this.logger.error('Error in process loop', {
-            error: errorMsg,
-            stack,
-          });
-          await Bun.sleep(1000);
-        }
-      }
+  /**
+   * Queues this worker consumes.
+   * Config queues replace the default priority set, but dynamic queues from
+   * `on(..., { queue })` are always appended so those tasks are still consumed.
+   */
+  private getQueueNames(): string[] {
+    if (this.config.queues && this.config.queues.length > 0) {
+      const fromConfig = [...this.config.queues]
+        .sort((a, b) => a.priority - b.priority)
+        .map((q) => q.name);
+      const configSet = new Set(fromConfig);
+      const extras = [...this.registeredQueues].filter((n) => !configSet.has(n));
+      return [...fromConfig, ...extras];
     }
+    const names = [
+      Priority.URGENT,
+      Priority.DEFAULT,
+      Priority.LOW,
+      ...this.registeredQueues,
+    ];
+    return [...new Set(names)];
   }
 
-  private parseMessage(id: string, fields: unknown[]): StreamMessage | null {
-    try {
-      const data = parseFields(fields);
-
-      return {
-        id,
-        taskName: data.taskName || '',
-        payload: JSON.parse(data.payload || 'null'),
-        deliveryCount: 1,
-        enqueuedAt: parseInt(data.enqueuedAt || '0', 10) || Date.now(),
-      };
-    } catch (err) {
-      this.logger.error('Error parsing message', { error: String(err) });
-      return null;
-    }
-  }
-
-  private async handleMessage(
-    streamKey: string,
-    message: StreamMessage,
-  ): Promise<void> {
-    const task = this.tasks.get(message.taskName);
-
+  private async onJobDelivery(delivery: JobDelivery): Promise<void> {
+    const task = this.tasks.get(delivery.taskName);
     if (!task) {
-      this.logger.warn(`Unknown task: ${message.taskName}`);
-      this.queueAck(streamKey, message.id);
+      this.logger.warn(`Unknown task: ${delivery.taskName}`);
+      await delivery.ack();
       return;
     }
 
-    const taskPromise = this.executeTask(streamKey, message, task);
-    this.activeTasks.add(taskPromise);
-    taskPromise.finally(() => this.activeTasks.delete(taskPromise));
+    const run = this.executeDelivery(delivery, task);
+    this.activeTasks.add(run);
+    try {
+      await run;
+    } finally {
+      this.activeTasks.delete(run);
+    }
   }
 
-  private async executeTask(
-    streamKey: string,
-    message: StreamMessage,
+  private async executeDelivery(
+    delivery: JobDelivery,
     task: TaskConfig,
   ): Promise<void> {
     try {
-      this.logger.debug(`Executing task: ${task.name}`);
-
-      // Determine effective timeouts
-      // 1. Message-specific timeout (highest priority)
-      // 2. Task-specific hard timeout
-      // 3. Queue-specific hard timeout (if applicable - would need lookup)
-      // 4. No timeout
-
-      // TODO: We could look up the queue's hardTimeout if available
-
-      const hardTimeout = task.hardTimeout;
+      const hardTimeout =
+        delivery.meta.timeout && delivery.meta.timeout > 0
+          ? delivery.meta.timeout
+          : task.hardTimeout;
 
       let result: void | WorkflowInstruction;
-
       if (hardTimeout && hardTimeout > 0) {
         result = await Promise.race([
-          task.handler(message.payload),
+          task.handler(delivery.payload),
           new Promise<never>((_, reject) =>
             setTimeout(
-              () => reject(new HardTimeout(`Task exceeded ${hardTimeout}ms`)),
+              () =>
+                reject(new HardTimeout(`Task exceeded ${hardTimeout}ms`)),
               hardTimeout,
             ),
           ),
         ]);
       } else {
-        result = await task.handler(message.payload);
+        result = await task.handler(delivery.payload);
       }
 
       if (result && typeof result === 'object' && 'next' in result) {
         const instruction = result as WorkflowInstruction;
-
-        if (instruction.delay && instruction.delay > 0) {
-          await this.schedule(
-            instruction.next,
-            instruction.payload,
-            instruction.delay,
-          );
-        } else {
-          await this.enqueue(instruction.next, instruction.payload);
-        }
-
-        this.logger.debug(
-          `Chained to: ${instruction.next}` +
-            (instruction.delay ? ` (delay: ${instruction.delay}ms)` : ''),
-        );
-      }
-
-      // Queue ACK for batched processing (much faster than individual ACKs)
-      this.queueAck(streamKey, message.id);
-
-      this.logger.debug(`Completed: ${task.name}`);
-    } catch (err) {
-      this.logger.error(`Task failed: ${task.name}`, { error: String(err) });
-    }
-  }
-
-  /**
-   * Queue a message ACK for batched processing.
-   * ACKs are flushed periodically or when batch size is reached.
-   */
-  private queueAck(streamKey: string, messageId: string): void {
-    let pending = this.pendingAcks.get(streamKey);
-    if (!pending) {
-      pending = [];
-      this.pendingAcks.set(streamKey, pending);
-    }
-    pending.push(messageId);
-
-    // Flush immediately if batch size reached
-    if (pending.length >= this.ACK_BATCH_SIZE) {
-      this.flushStreamAcks(streamKey, pending).catch((err) => {
-        this.logger.error('Failed to flush ACKs', { error: String(err) });
-      });
-      this.pendingAcks.set(streamKey, []);
-    }
-  }
-
-  /**
-   * Flush all pending ACKs across all streams.
-   */
-  private async flushAcks(): Promise<void> {
-    const flushPromises: Promise<void>[] = [];
-
-    for (const [streamKey, messageIds] of this.pendingAcks) {
-      if (messageIds.length > 0) {
-        flushPromises.push(this.flushStreamAcks(streamKey, messageIds));
-        this.pendingAcks.set(streamKey, []);
-      }
-    }
-
-    await Promise.all(flushPromises);
-  }
-
-  /**
-   * Flush ACKs for a specific stream (batched XACK).
-   */
-  private async flushStreamAcks(
-    streamKey: string,
-    messageIds: string[],
-  ): Promise<void> {
-    if (messageIds.length === 0) return;
-
-    // XACK supports multiple message IDs in a single call
-    await this._redis.send('XACK', [
-      streamKey,
-      this.config.consumerGroup,
-      ...messageIds,
-    ]);
-
-    // Optionally remove the now-processed entries so the stream stays bounded.
-    // XDEL runs only after a successful XACK, so it never touches unacked
-    // (in-flight) messages the reclaimer still needs.
-    if (this.config.deleteOnAck) {
-      await this._redis.send('XDEL', [streamKey, ...messageIds]);
-    }
-  }
-
-  private async runReclaimer(): Promise<void> {
-    try {
-      const streamKeys = this.stream.getStreamKeys();
-
-      for (const streamKey of streamKeys) {
-        const claimed = await this.reclaimer.reclaimIdleMessages(streamKey);
-
-        for (const message of claimed) {
-          if (message.deliveryCount > this.config.maxDeliveries) {
-            await this.moveToDeadLetter(streamKey, message);
+        try {
+          if (instruction.delay && instruction.delay > 0) {
+            await this.schedule(
+              instruction.next,
+              instruction.payload,
+              instruction.delay,
+            );
           } else {
-            await this.handleMessage(streamKey, message);
+            await this.enqueue(instruction.next, instruction.payload);
           }
+        } catch (err) {
+          this.logger.error('Chaining failed', { error: String(err) });
+          throw err;
         }
       }
+
+      await delivery.ack();
     } catch (err) {
-      this.logger.error('Reclaimer error', { error: String(err) });
+      const error = err instanceof Error ? err.message : String(err);
+      this.logger.error(`Task failed: ${task.name}`, { error });
+
+      const max =
+        delivery.meta.attempts ??
+        task.maxRetries ??
+        this.config.maxDeliveries;
+
+      if (delivery.deliveryCount > max) {
+        await delivery.deadLetter({ error });
+        return;
+      }
+
+      const delayMs = delivery.meta.backoff
+        ? computeBackoff(delivery.meta.backoff, delivery.deliveryCount)
+        : this.config.idleTimeout;
+
+      await delivery.retry({ delayMs, error });
     }
-  }
-
-  private async moveToDeadLetter(
-    streamKey: string,
-    message: StreamMessage,
-  ): Promise<void> {
-    let priority = Priority.DEFAULT;
-    if (streamKey.includes(Priority.URGENT)) {
-      priority = Priority.URGENT;
-    } else if (streamKey.includes(Priority.LOW)) {
-      priority = Priority.LOW;
-    }
-
-    const deadLetterKey = getDeadLetterKey(priority);
-
-    this.logger.warn(
-      `Moving to dead-letter: ${message.taskName} (${message.id})`,
-    );
-
-    await this._redis.send('XADD', [
-      deadLetterKey,
-      '*',
-      'taskName',
-      message.taskName,
-      'payload',
-      JSON.stringify(message.payload),
-      'enqueuedAt',
-      String(message.enqueuedAt),
-      'originalId',
-      message.id,
-      'deliveryCount',
-      String(message.deliveryCount),
-      'deadLetteredAt',
-      String(Date.now()),
-    ]);
-
-    this.queueAck(streamKey, message.id);
   }
 
   private setupSignalHandlers(): void {
@@ -621,9 +511,10 @@ export class Worker {
       await this.stop();
       process.exit(0);
     };
-
     process.on('SIGTERM', () => handleSignal('SIGTERM'));
     process.on('SIGINT', () => handleSignal('SIGINT'));
     process.on('SIGQUIT', () => handleSignal('SIGQUIT'));
   }
 }
+
+void Queue;

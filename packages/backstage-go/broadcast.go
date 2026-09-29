@@ -5,13 +5,14 @@ package backstage
 import (
 	"context"
 	"encoding/json"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
 // BroadcastStream is the Redis stream key used for broadcast messages.
-const BroadcastStream = "backstage:broadcast"
+const BroadcastStream = "backstage:broadcast" // legacy constant; prefer BroadcastStreamKey
 
 // BroadcastStartPosition controls where a newly created broadcast consumer
 // group begins reading.
@@ -61,7 +62,7 @@ type BroadcastListener struct {
 	consumerID    string
 	handler       BroadcastHandler
 	config        BroadcastConfig
-	running       bool
+	running       atomic.Bool
 	logger        *Logger
 }
 
@@ -92,9 +93,9 @@ func (b *BroadcastListener) Start(ctx context.Context) error {
 		return err
 	}
 
-	b.running = true
+	b.running.Store(true)
 
-	for b.running {
+	for b.running.Load() {
 		result, err := b.redis.XReadGroup(ctx, &redis.XReadGroupArgs{
 			Group:    b.consumerGroup,
 			Consumer: b.consumerID,
@@ -107,7 +108,7 @@ func (b *BroadcastListener) Start(ctx context.Context) error {
 			continue
 		}
 		if err != nil {
-			if b.running {
+			if b.running.Load() {
 				time.Sleep(time.Second)
 			}
 			continue
@@ -125,7 +126,7 @@ func (b *BroadcastListener) Start(ctx context.Context) error {
 
 // Stop stops the broadcast listener.
 func (b *BroadcastListener) Stop() {
-	b.running = false
+	b.running.Store(false)
 }
 
 func (b *BroadcastListener) handleMessage(ctx context.Context, msg redis.XMessage) {

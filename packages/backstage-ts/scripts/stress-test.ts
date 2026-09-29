@@ -62,10 +62,6 @@ async function main() {
     });
   });
 
-  // Initialize stream consumer groups BEFORE enqueueing
-  // This ensures messages can be properly consumed
-  await worker['stream'].initialize();
-
   // --- PHASE 1: ENQUEUE ---
   console.log('🚀 Phase 1: Enqueueing...');
   const enqueueStart = performance.now();
@@ -99,10 +95,7 @@ async function main() {
   // --- PHASE 2: PROCESSING ---
   console.log('\n⚙️  Phase 2: Processing...');
 
-  // Debug: show which streams we're reading from
-  const streamKeys = worker['stream'].getStreamKeys();
-  console.log(`   Streams: ${streamKeys.join(', ')}`);
-  console.log(`   Consumer group: ${worker['config'].consumerGroup}`);
+  console.log(`   Caps: ${JSON.stringify(worker.capabilities())}`);
 
   // Start the worker (don't await - it blocks until stop() is called)
   // The processLoop runs indefinitely, processing messages

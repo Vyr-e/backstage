@@ -200,3 +200,38 @@ new Broadcast({ redis, workerId }); // Standalone
 broadcast.initialize();
 broadcast.send(taskName, payload);
 ```
+
+
+## Provider architecture (v1.2.0)
+
+Transport is swappable via `provider`. Default remains Redis Streams (wire-compatible).
+
+```ts
+import { Worker } from '@vyr-e/backstage';
+import { RabbitMQProvider } from '@vyr-e/backstage/rabbitmq';
+import { KafkaProvider } from '@vyr-e/backstage/kafka';
+
+// Redis (default)
+new Worker({ host: 'localhost', port: 6379 });
+
+// RabbitMQ (peer: amqplib)
+new Worker({ provider: new RabbitMQProvider({ url: 'amqp://localhost' }) });
+
+// Kafka (peer: kafkajs) — plug delays/dedupe as needed
+// Defaults: 3 partitions, replicationFactor 3. Use 1/1 for single-broker tests.
+// Limits: no transactional producers; no log compaction.
+new Worker({
+  provider: new KafkaProvider({
+    brokers: ['localhost:9092'],
+    // partitions: 1, replicationFactor: 1, // for single-broker docker
+  }),
+  capabilities: { /* delays, dedupe */ },
+});
+
+worker.publish('ride.cancelled', { rideId });
+worker.subscribe('ride.cancelled', async (payload, msg) => { /* fan-out */ });
+worker.subscribe('ride.cancelled', handler, { group: 'billing' });
+worker.capabilities(); // CapabilityReport
+```
+
+Legacy `Broadcast` is deprecated in favor of topics. See `docs/providers/`.

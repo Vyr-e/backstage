@@ -8,6 +8,8 @@ import {
   parseFields,
   type BackoffConfig,
 } from './types';
+import { computeBackoff } from './compute-backoff';
+import type { RedisStreamsProvider } from './provider/redis';
 import { Logger, createLogger, LogLevel, type LoggerConfig } from './logger';
 
 /**
@@ -15,6 +17,27 @@ import { Logger, createLogger, LogLevel, type LoggerConfig } from './logger';
  * Uses XPENDING and XCLAIM to re-assign tasks that have timed out.
  */
 export class Reclaimer {
+  /**
+   * Build a Reclaimer over a RedisStreamsProvider (compat wrapper).
+   */
+  static fromProvider(
+    provider: RedisStreamsProvider,
+    consumerGroup: string,
+    consumerId: string,
+    idleTimeout: number,
+    maxDeliveries: number,
+    loggerConfig?: LoggerConfig,
+  ): Reclaimer {
+    return new Reclaimer(
+      provider.redis,
+      consumerGroup,
+      consumerId,
+      idleTimeout,
+      maxDeliveries,
+      loggerConfig,
+    );
+  }
+
   private redis: RedisClient;
   private consumerGroup: string;
   private consumerId: string;
@@ -184,29 +207,7 @@ export class Reclaimer {
   }
 
   private calculateBackoff(config: BackoffConfig, attempts: number): number {
-    // Delivery count starts at 1. First retry is attempt 2.
-    // So if deliveryCount is 1, we shouldn't be here (it's new).
-    // If deliveryCount is 2, retry count is 1.
-
-    // We want the delay after the *previous* failure.
-    // So for deliveryCount X, we have failed X-1 times.
-
-    const retries = Math.max(0, attempts - 1);
-
-    if (config.type === 'fixed') {
-      return config.delay;
-    }
-
-    if (config.type === 'exponential') {
-      // Exponential backoff: delay * 2^(retries-1)
-      // First retry (retries=1): delay * 2^0 = delay * 1
-      // Second retry (retries=2): delay * 2^1 = delay * 2
-      const delay = config.delay * Math.pow(2, retries - 1);
-      const max = config.maxDelay ?? 3600000; // 1 hour default cap
-      return Math.min(delay, max);
-    }
-
-    return 0;
+    return computeBackoff(config, attempts);
   }
 
   private parseMessage(

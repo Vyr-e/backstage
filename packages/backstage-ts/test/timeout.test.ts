@@ -1,21 +1,40 @@
-import { describe, test, expect } from 'bun:test';
+import { describe, test, expect, afterEach } from 'bun:test';
 import { Worker } from '../src/worker';
-import { HardTimeout } from '../src/exceptions';
+import { RedisStreamsProvider } from '../src/provider/redis';
 
 describe('Worker Timeouts', () => {
-  test('enforces hard timeout', async () => {
-    const worker = new Worker();
-    let error: Error | undefined;
+  let worker: Worker | null = null;
 
-    // Mock logger to capture error
-    const originalError = worker['logger'].error;
-    worker['logger'].error = (msg, meta) => {
-      if (meta?.error) {
-        // It comes as a string in the logger
-      }
+  afterEach(async () => {
+    if (worker) {
+      await worker.stop().catch(() => {});
+      worker = null;
+    }
+  });
+
+  test('enforces hard timeout from task config', async () => {
+    const prefix = `timeout-${Date.now()}`;
+    const provider = new RedisStreamsProvider({
+      host: 'localhost',
+      port: 6379,
+      prefix,
+      reclaimIntervalMs: 60_000,
+      blockTimeout: 200,
+    });
+    worker = new Worker({
+      provider,
+      consumerGroup: `cg-${prefix}`,
+      workerId: `w-${prefix}`,
+      idleTimeout: 60_000,
+      maxDeliveries: 5,
+      concurrency: 2,
+      prefetch: 2,
+    });
+
+    let captured = '';
+    (worker as any).logger.error = (_msg: string, meta: any) => {
+      captured = meta?.error || '';
     };
-
-    const start = performance.now();
 
     worker.on(
       'slow.task',
@@ -23,36 +42,61 @@ describe('Worker Timeouts', () => {
         await Bun.sleep(500);
       },
       { hardTimeout: 50 },
-    ); // 50ms timeout
+    );
 
-    // Manually trigger executeTask (private method)
-    const taskConfig = (worker as any).tasks.get('slow.task');
-    const executeTask = (worker as any).executeTask.bind(worker);
+    void worker.start();
+    await Bun.sleep(50);
+    const start = performance.now();
+    await worker.enqueue('slow.task', {});
 
-    // Mock message
-    const message = {
-      id: '1-0',
-      taskName: 'slow.task',
-      payload: {},
-      deliveryCount: 1,
-      enqueuedAt: Date.now(),
-    };
-    const streamKey = 'backstage:default';
-
-    // We need to spy on the logger to verify the error type
-    let capturedErrorStr = '';
-    (worker as any).logger.error = (msg: string, meta: any) => {
-      capturedErrorStr = meta?.error || '';
-    };
-    (worker as any).ack = async () => {}; // Mock ack
-
-    await executeTask(streamKey, message, taskConfig);
+    const deadline = Date.now() + 3000;
+    while (!captured && Date.now() < deadline) {
+      await Bun.sleep(20);
+    }
 
     const elapsed = performance.now() - start;
+    expect(elapsed).toBeLessThan(400);
+    expect(captured).toContain('exceeded 50ms');
+  });
 
-    // It should have finished near 50ms, not 500ms
-    expect(elapsed).toBeLessThan(200);
-    expect(capturedErrorStr).toContain('HardTimeout');
-    expect(capturedErrorStr).toContain('exceeded 50ms');
+  test('honors per-message timeout over task hardTimeout', async () => {
+    const prefix = `timeout-msg-${Date.now()}`;
+    const provider = new RedisStreamsProvider({
+      host: 'localhost',
+      port: 6379,
+      prefix,
+      reclaimIntervalMs: 60_000,
+      blockTimeout: 200,
+    });
+    worker = new Worker({
+      provider,
+      consumerGroup: `cg-${prefix}`,
+      workerId: `w-${prefix}`,
+      idleTimeout: 60_000,
+      maxDeliveries: 5,
+    });
+
+    let captured = '';
+    (worker as any).logger.error = (_msg: string, meta: any) => {
+      captured = meta?.error || '';
+    };
+
+    worker.on(
+      'slow.task',
+      async () => {
+        await Bun.sleep(500);
+      },
+      { hardTimeout: 5000 },
+    );
+
+    void worker.start();
+    await Bun.sleep(50);
+    await worker.enqueue('slow.task', {}, { timeout: 40 });
+
+    const deadline = Date.now() + 3000;
+    while (!captured && Date.now() < deadline) {
+      await Bun.sleep(20);
+    }
+    expect(captured).toContain('exceeded 40ms');
   });
 });
