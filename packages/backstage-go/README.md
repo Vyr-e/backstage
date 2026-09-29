@@ -65,6 +65,8 @@ client.Start(ctx, cfg)
 
 ## Enqueueing Tasks
 
+Pre-encoded JSON can be passed as []byte or json.RawMessage.
+
 ```go
 // Immediate
 client.Enqueue(ctx, "order.process", order)

@@ -341,3 +341,68 @@ func TestRabbitPublishThroughput(t *testing.T) {
 	}
 	t.Logf("%d concurrent publishes in %v", n, elapsed)
 }
+
+func TestRabbitEncodePayloadBytes(t *testing.T) {
+	ctx := context.Background()
+	prefix := fmt.Sprintf("ep-rmq-%d", time.Now().UnixNano())
+	p := rabbitmq.New(rabbitmq.Config{URL: "amqp://guest:guest@localhost:5672/", Prefix: prefix})
+	if err := p.Init(ctx, backstage.ProviderContext{
+		Capabilities: backstage.ResolvedCapabilities{Jobs: p.Jobs(), Topics: p.Topics()},
+		Logger:       backstage.NewLogger("t"),
+	}); err != nil {
+		t.Fatalf("RabbitMQ required: %v", err)
+	}
+	defer p.Close()
+
+	q := "ep"
+	_ = p.Jobs().EnsureQueues(ctx, []string{q})
+
+	got := make(chan []byte, 2)
+	sub, err := p.Jobs().Consume(ctx, backstage.ConsumeOptions{
+		Queues: []string{q}, Group: "g", ConsumerID: "c", Prefetch: 2, IdleTimeout: 1000,
+	}, func(ctx context.Context, d backstage.JobDelivery) error {
+		got <- append([]byte(nil), d.Payload()...)
+		return d.Ack(ctx)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Stop(ctx)
+
+	sonicBytes := []byte(`{"hello":"world","n":1}`)
+	_, err = p.Jobs().Publish(ctx, backstage.OutgoingJob{
+		Queue: q, TaskName: "t", Payload: sonicBytes, EnqueuedAt: time.Now().UnixMilli(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case payload := <-got:
+		if string(payload) != string(sonicBytes) {
+			t.Fatalf("valid JSON []byte: want object %s, got %q", sonicBytes, payload)
+		}
+		var obj map[string]interface{}
+		if err := json.Unmarshal(payload, &obj); err != nil || obj["hello"] != "world" {
+			t.Fatalf("expected JSON object, got %s err=%v", payload, err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("timeout valid")
+	}
+
+	invalid := []byte("not-json")
+	wantInvalid, _ := json.Marshal(invalid)
+	_, err = p.Jobs().Publish(ctx, backstage.OutgoingJob{
+		Queue: q, TaskName: "t", Payload: invalid, EnqueuedAt: time.Now().UnixMilli(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case payload := <-got:
+		if string(payload) != string(wantInvalid) {
+			t.Fatalf("invalid []byte: want base64 %s, got %q", wantInvalid, payload)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("timeout invalid")
+	}
+}

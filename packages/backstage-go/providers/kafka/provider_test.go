@@ -159,3 +159,71 @@ func TestKafkaReconnectAfterBrokerKill(t *testing.T) {
 		t.Fatal("job after kafka restart not processed")
 	}
 }
+
+func TestKafkaEncodePayloadBytes(t *testing.T) {
+	ctx := context.Background()
+	prefix := fmt.Sprintf("ep-kfk-%d", time.Now().UnixNano())
+	p := kafka.New(kafka.Config{Brokers: []string{"localhost:9092"}, Prefix: prefix, Partitions: 1, ReplicationFactor: 1})
+	if err := p.Init(ctx, backstage.ProviderContext{
+		Capabilities: backstage.ResolvedCapabilities{Jobs: p.Jobs(), Topics: p.Topics()},
+		Logger:       backstage.NewLogger("t"),
+	}); err != nil {
+		t.Fatalf("Kafka required: %v", err)
+	}
+	defer p.Close()
+
+	q := "ep"
+	if err := p.Jobs().EnsureQueues(ctx, []string{q}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := make(chan []byte, 2)
+	sub, err := p.Jobs().Consume(ctx, backstage.ConsumeOptions{
+		Queues: []string{q}, Group: "g-" + prefix, ConsumerID: "c", Prefetch: 2, IdleTimeout: 1000,
+	}, func(ctx context.Context, d backstage.JobDelivery) error {
+		got <- append([]byte(nil), d.Payload()...)
+		return d.Ack(ctx)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Stop(ctx)
+	time.Sleep(2 * time.Second)
+
+	sonicBytes := []byte(`{"hello":"world","n":1}`)
+	_, err = p.Jobs().Publish(ctx, backstage.OutgoingJob{
+		Queue: q, TaskName: "t", Payload: sonicBytes, EnqueuedAt: time.Now().UnixMilli(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case payload := <-got:
+		if string(payload) != string(sonicBytes) {
+			t.Fatalf("valid JSON []byte: want object %s, got %q", sonicBytes, payload)
+		}
+		var obj map[string]interface{}
+		if err := json.Unmarshal(payload, &obj); err != nil || obj["hello"] != "world" {
+			t.Fatalf("expected JSON object, got %s err=%v", payload, err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("timeout valid")
+	}
+
+	invalid := []byte("not-json")
+	wantInvalid, _ := json.Marshal(invalid)
+	_, err = p.Jobs().Publish(ctx, backstage.OutgoingJob{
+		Queue: q, TaskName: "t", Payload: invalid, EnqueuedAt: time.Now().UnixMilli(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case payload := <-got:
+		if string(payload) != string(wantInvalid) {
+			t.Fatalf("invalid []byte: want base64 %s, got %q", wantInvalid, payload)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("timeout invalid")
+	}
+}

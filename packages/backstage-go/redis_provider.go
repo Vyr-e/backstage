@@ -137,21 +137,11 @@ func (p *RedisStreamsProvider) ensureGroup(ctx context.Context, key, group, star
 }
 
 func payloadJSON(v interface{}) (string, error) {
-	switch x := v.(type) {
-	case json.RawMessage:
-		if len(x) == 0 {
-			return "null", nil
-		}
-		return string(x), nil
-	case nil:
-		return "null", nil
-	default:
-		b, err := json.Marshal(v)
-		if err != nil {
-			return "", err
-		}
-		return string(b), nil
+	b, err := EncodePayload(v)
+	if err != nil {
+		return "", err
 	}
+	return string(b), nil
 }
 
 // --- ack batcher ---

@@ -2,7 +2,6 @@ package backstage
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -140,7 +139,7 @@ func (c *Client) Broadcast(ctx context.Context, taskName string, payload interfa
 	if c.redis == nil {
 		return "", fmt.Errorf("Broadcast is Redis-only; use Publish/Subscribe topics")
 	}
-	payloadBytes, err := json.Marshal(payload)
+	payloadBytes, err := EncodePayload(payload)
 	if err != nil {
 		return "", fmt.Errorf("marshal payload: %w", err)
 	}

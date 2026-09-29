@@ -206,13 +206,18 @@ type wireJob struct {
 }
 
 func (j *jobsCap) Publish(ctx context.Context, job backstage.OutgoingJob) (string, error) {
-	payload, _ := json.Marshal(job.Payload)
-	body, _ := json.Marshal(wireJob{
+	payload, err := backstage.EncodePayload(job.Payload)
+	if err != nil {
+		return "", err
+	}
+	body, err := json.Marshal(wireJob{
 		TaskName: job.TaskName, Payload: payload, EnqueuedAt: job.EnqueuedAt,
 		Meta: job.Meta, DeliveryCount: max(1, job.DeliveryCount),
 	})
+	if err != nil {
+		return "", err
+	}
 	msg := kafka.Message{Topic: j.p.queueTopic(job.Queue), Value: body}
-	var err error
 	for attempt := 0; attempt < 8; attempt++ {
 		err = j.p.getWriter().WriteMessages(ctx, msg)
 		if err == nil {
@@ -403,8 +408,14 @@ func (t *topicsCap) Publish(ctx context.Context, topic string, payload interface
 	if err := t.p.ensureTopic(ctx, full); err != nil {
 		return "", err
 	}
-	body, _ := json.Marshal(map[string]interface{}{"payload": payload, "publishedAt": time.Now().UnixMilli(), "deliveryCount": 1})
-	var err error
+	encoded, err := backstage.EncodePayload(payload)
+	if err != nil {
+		return "", err
+	}
+	body, err := json.Marshal(map[string]interface{}{"payload": json.RawMessage(encoded), "publishedAt": time.Now().UnixMilli(), "deliveryCount": 1})
+	if err != nil {
+		return "", err
+	}
 	for attempt := 0; attempt < 8; attempt++ {
 		err = t.p.getWriter().WriteMessages(ctx, kafka.Message{Topic: full, Value: body})
 		if err == nil {

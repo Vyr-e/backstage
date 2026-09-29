@@ -273,12 +273,18 @@ type wireJob struct {
 }
 
 func (j *jobsCap) Publish(ctx context.Context, job backstage.OutgoingJob) (string, error) {
-	payload, _ := json.Marshal(job.Payload)
-	body, _ := json.Marshal(wireJob{
+	payload, err := backstage.EncodePayload(job.Payload)
+	if err != nil {
+		return "", err
+	}
+	body, err := json.Marshal(wireJob{
 		Queue: job.Queue, TaskName: job.TaskName, Payload: payload,
 		EnqueuedAt: job.EnqueuedAt, Meta: job.Meta, DeliveryCount: max(1, job.DeliveryCount),
 	})
-	err := j.p.publishConfirmed(ctx, "", j.p.q(job.Queue), amqp.Publishing{
+	if err != nil {
+		return "", err
+	}
+	err = j.p.publishConfirmed(ctx, "", j.p.q(job.Queue), amqp.Publishing{
 		DeliveryMode: amqp.Persistent, Body: body,
 	})
 	return fmt.Sprintf("rabbit-%d", job.EnqueuedAt), err
@@ -511,11 +517,17 @@ func (d *delayedDelays) Schedule(ctx context.Context, job backstage.OutgoingJob,
 	if delay < 0 {
 		delay = 0
 	}
-	payload, _ := json.Marshal(job.Payload)
-	body, _ := json.Marshal(wireJob{
+	payload, err := backstage.EncodePayload(job.Payload)
+	if err != nil {
+		return "", err
+	}
+	body, err := json.Marshal(wireJob{
 		Queue: job.Queue, TaskName: job.TaskName, Payload: payload,
 		EnqueuedAt: job.EnqueuedAt, Meta: job.Meta, DeliveryCount: max(1, job.DeliveryCount),
 	})
+	if err != nil {
+		return "", err
+	}
 	// Bind once via ensureQueues; schedule only publishes.
 	d.p.mu.Lock()
 	_, bound := d.p.boundQueues[job.Queue]
@@ -535,7 +547,7 @@ func (d *delayedDelays) Schedule(ctx context.Context, job backstage.OutgoingJob,
 		d.p.boundQueues[job.Queue] = struct{}{}
 		d.p.mu.Unlock()
 	}
-	err := d.p.publishConfirmed(ctx, d.p.prefix+".delayed", job.Queue, amqp.Publishing{
+	err = d.p.publishConfirmed(ctx, d.p.prefix+".delayed", job.Queue, amqp.Publishing{
 		DeliveryMode: amqp.Persistent, Body: body, Headers: amqp.Table{"x-delay": delay},
 	})
 	return fmt.Sprintf("scheduled:%d", runAt), err
@@ -553,7 +565,14 @@ func (t *topicsCap) Publish(ctx context.Context, topic string, payload interface
 	if err := ch.ExchangeDeclare(ex, "topic", true, false, false, false, nil); err != nil {
 		return "", err
 	}
-	body, _ := json.Marshal(map[string]interface{}{"payload": payload, "publishedAt": time.Now().UnixMilli(), "deliveryCount": 1})
+	encoded, err := backstage.EncodePayload(payload)
+	if err != nil {
+		return "", err
+	}
+	body, err := json.Marshal(map[string]interface{}{"payload": json.RawMessage(encoded), "publishedAt": time.Now().UnixMilli(), "deliveryCount": 1})
+	if err != nil {
+		return "", err
+	}
 	err = t.p.publishConfirmed(ctx, ex, topic, amqp.Publishing{DeliveryMode: amqp.Persistent, Body: body})
 	return fmt.Sprintf("topic-%d", time.Now().UnixMilli()), err
 }
