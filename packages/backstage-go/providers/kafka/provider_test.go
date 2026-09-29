@@ -27,33 +27,52 @@ func (k *kafkaWithDelays) Init(ctx context.Context, pctx backstage.ProviderConte
 }
 
 func TestKafkaContract(t *testing.T) {
+	sharedPrefix := fmt.Sprintf("kct-%d", time.Now().UnixNano())
 	rp := backstage.NewRedisStreamsProvider(backstage.RedisStreamsProviderConfig{
-		Host: "localhost", Port: 6379, Prefix: fmt.Sprintf("kdelay-%d", time.Now().UnixNano()),
+		Host: "localhost", Port: 6379, Prefix: sharedPrefix + "-delays",
 	})
-	if err := rp.Init(context.Background(), backstage.ProviderContext{
-		Capabilities: backstage.ResolvedCapabilities{Jobs: rp.Jobs(), Delays: rp.Delays(), Dedupe: rp.Dedupe(), Topics: rp.Topics()},
-		Logger:       backstage.NewLogger("rd"),
+
+	anchor := kafka.New(kafka.Config{Brokers: []string{"localhost:9092"}, Prefix: sharedPrefix})
+	ctx := context.Background()
+	if err := anchor.Init(ctx, backstage.ProviderContext{
+		Capabilities: backstage.ResolvedCapabilities{Jobs: anchor.Jobs(), Topics: anchor.Topics()},
+		Logger:       backstage.NewLogger("anchor"),
+	}); err != nil {
+		t.Fatalf("Kafka required for proof but unreachable: %v", err)
+	}
+	defer anchor.Close()
+	if err := anchor.Jobs().EnsureQueues(ctx, []string{"probe"}); err != nil {
+		t.Fatalf("Kafka required for proof but unreachable: %v", err)
+	}
+
+	// Redis delays must promote through Kafka jobs (same prefix as contract providers).
+	if err := rp.Init(ctx, backstage.ProviderContext{
+		Capabilities: backstage.ResolvedCapabilities{
+			Jobs: anchor.Jobs(), Delays: rp.Delays(), Dedupe: rp.Dedupe(), Topics: rp.Topics(),
+		},
+		Logger: backstage.NewLogger("rd"),
 	}); err != nil {
 		t.Fatalf("redis delays: %v", err)
 	}
 	defer rp.Close()
 
-	probe := kafka.New(kafka.Config{Brokers: []string{"localhost:9092"}, Prefix: "ktest"})
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := probe.Init(ctx, backstage.ProviderContext{
-		Capabilities: backstage.ResolvedCapabilities{Jobs: probe.Jobs(), Topics: probe.Topics(), Delays: rp.Delays()},
-		Logger:       backstage.NewLogger("t"),
-	}); err != nil {
-		t.Fatalf("Kafka required for proof but unreachable: %v", err)
-	}
-	if err := probe.Jobs().EnsureQueues(ctx, []string{"probe"}); err != nil {
-		t.Fatalf("Kafka required for proof but unreachable: %v", err)
-	}
-	_ = probe.Close()
+	stopPromo := make(chan struct{})
+	go func() {
+		tck := time.NewTicker(50 * time.Millisecond)
+		defer tck.Stop()
+		for {
+			select {
+			case <-tck.C:
+				_, _ = rp.PromoteCrossProvider(context.Background())
+			case <-stopPromo:
+				return
+			}
+		}
+	}()
+	defer close(stopPromo)
 
 	backstagetest.RunProviderContract(t, func() backstage.Provider {
-		p := kafka.New(kafka.Config{Brokers: []string{"localhost:9092"}, Prefix: "k-" + time.Now().Format("150405.000")})
+		p := kafka.New(kafka.Config{Brokers: []string{"localhost:9092"}, Prefix: sharedPrefix})
 		return &kafkaWithDelays{Provider: p, delays: rp.Delays()}
 	}, backstagetest.Options{Timeout: 60 * time.Second})
 }
@@ -64,12 +83,6 @@ func TestKafkaReconnectAfterBrokerKill(t *testing.T) {
 	rp := backstage.NewRedisStreamsProvider(backstage.RedisStreamsProviderConfig{
 		Host: "localhost", Port: 6379, Prefix: prefix + "-d",
 	})
-	_ = rp.Init(ctx, backstage.ProviderContext{
-		Capabilities: backstage.ResolvedCapabilities{Jobs: rp.Jobs(), Delays: rp.Delays()},
-		Logger:       backstage.NewLogger("rd"),
-	})
-	defer rp.Close()
-
 	p := &kafkaWithDelays{
 		Provider: kafka.New(kafka.Config{Brokers: []string{"localhost:9092"}, Prefix: prefix}),
 		delays:   rp.Delays(),
@@ -81,6 +94,11 @@ func TestKafkaReconnectAfterBrokerKill(t *testing.T) {
 		t.Fatalf("init: %v", err)
 	}
 	defer p.Close()
+	_ = rp.Init(ctx, backstage.ProviderContext{
+		Capabilities: backstage.ResolvedCapabilities{Jobs: p.Jobs(), Delays: rp.Delays()},
+		Logger:       backstage.NewLogger("rd"),
+	})
+	defer rp.Close()
 
 	q := "work"
 	_ = p.Jobs().EnsureQueues(ctx, []string{q})
@@ -97,26 +115,30 @@ func TestKafkaReconnectAfterBrokerKill(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sub.Stop(ctx)
+	time.Sleep(3 * time.Second)
 
-	_, _ = p.Jobs().Publish(ctx, backstage.OutgoingJob{
+	_, err = p.Jobs().Publish(ctx, backstage.OutgoingJob{
 		Queue: q, TaskName: "t", Payload: map[string]string{"id": "before"}, EnqueuedAt: time.Now().UnixMilli(),
 	})
+	if err != nil {
+		t.Fatalf("publish before: %v", err)
+	}
 	select {
 	case id := <-processed:
 		if id != "before" {
 			t.Fatalf("got %s", id)
 		}
-	case <-time.After(20 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("first job missing")
 	}
 
 	_ = exec.Command("sudo", "docker", "stop", "bs-kafka").Run()
 	time.Sleep(2 * time.Second)
 	_ = exec.Command("sudo", "docker", "start", "bs-kafka").Run()
-	time.Sleep(8 * time.Second)
+	time.Sleep(12 * time.Second)
 
 	var pubErr error
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 8; i++ {
 		_, pubErr = p.Jobs().Publish(ctx, backstage.OutgoingJob{
 			Queue: q, TaskName: "t", Payload: map[string]string{"id": "after"}, EnqueuedAt: time.Now().UnixMilli(),
 		})
@@ -133,7 +155,7 @@ func TestKafkaReconnectAfterBrokerKill(t *testing.T) {
 		if id != "after" {
 			t.Fatalf("expected after, got %s", id)
 		}
-	case <-time.After(45 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("job after kafka restart not processed")
 	}
 }

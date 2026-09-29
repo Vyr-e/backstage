@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -62,10 +63,11 @@ func (p *Provider) Init(ctx context.Context, pctx backstage.ProviderContext) err
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.writer = &kafka.Writer{
-		Addr:         kafka.TCP(p.brokers...),
-		Balancer:     &kafka.LeastBytes{},
-		RequiredAcks: kafka.RequireAll,
-		Async:        false,
+		Addr:                   kafka.TCP(p.brokers...),
+		Balancer:               &kafka.LeastBytes{},
+		RequiredAcks:           kafka.RequireAll,
+		Async:                  false,
+		AllowAutoTopicCreation: false,
 	}
 	return nil
 }
@@ -94,6 +96,7 @@ func (p *Provider) getWriter() *kafka.Writer {
 			Balancer:     &kafka.LeastBytes{},
 			RequiredAcks: kafka.RequireAll,
 			Async:        false,
+			Transport:    &kafka.Transport{MetadataTTL: 500 * time.Millisecond},
 		}
 	}
 	return p.writer
@@ -121,14 +124,59 @@ func (j *jobsCap) EnsureQueues(ctx context.Context, queues []string) error {
 	}
 	defer cconn.Close()
 	var topics []kafka.TopicConfig
+	var names []string
 	for _, q := range queues {
+		qt, dt := j.p.queueTopic(q), j.p.dlqTopic(q)
 		topics = append(topics,
-			kafka.TopicConfig{Topic: j.p.queueTopic(q), NumPartitions: 1, ReplicationFactor: 1},
-			kafka.TopicConfig{Topic: j.p.dlqTopic(q), NumPartitions: 1, ReplicationFactor: 1},
+			kafka.TopicConfig{Topic: qt, NumPartitions: 1, ReplicationFactor: 1},
+			kafka.TopicConfig{Topic: dt, NumPartitions: 1, ReplicationFactor: 1},
 		)
+		names = append(names, qt, dt)
 	}
-	return cconn.CreateTopics(topics...)
+	if err := cconn.CreateTopics(topics...); err != nil {
+		// Ignore "already exists"
+		if !isTopicExists(err) {
+			return err
+		}
+	}
+	// Wait until metadata shows the topics (CreateTopics is async on the broker).
+	deadline := time.Now().Add(15 * time.Second)
+	for _, name := range names {
+		for {
+			partitions, err := cconn.ReadPartitions(name)
+			if err == nil && len(partitions) > 0 {
+				break
+			}
+			if time.Now().After(deadline) {
+				return fmt.Errorf("topic %s not ready: %v", name, err)
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+	}
+	// Drop cached writer metadata so subsequent publishes see new topics.
+	j.p.mu.Lock()
+	if j.p.writer != nil {
+		_ = j.p.writer.Close()
+		j.p.writer = nil
+	}
+	j.p.mu.Unlock()
+	return nil
 }
+
+func isTopicExists(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "already exists") || strings.Contains(s, "TOPIC_ALREADY_EXISTS")
+}
+
+
+
 
 type wireJob struct {
 	TaskName      string            `json:"taskName"`
@@ -144,7 +192,29 @@ func (j *jobsCap) Publish(ctx context.Context, job backstage.OutgoingJob) (strin
 		TaskName: job.TaskName, Payload: payload, EnqueuedAt: job.EnqueuedAt,
 		Meta: job.Meta, DeliveryCount: max(1, job.DeliveryCount),
 	})
-	err := j.p.getWriter().WriteMessages(ctx, kafka.Message{Topic: j.p.queueTopic(job.Queue), Value: body})
+	msg := kafka.Message{Topic: j.p.queueTopic(job.Queue), Value: body}
+	var err error
+	for attempt := 0; attempt < 8; attempt++ {
+		err = j.p.getWriter().WriteMessages(ctx, msg)
+		if err == nil {
+			break
+		}
+		if !strings.Contains(err.Error(), "Unknown Topic") && !strings.Contains(err.Error(), "Leader Not Available") {
+			break
+		}
+		// Refresh writer metadata and retry
+		j.p.mu.Lock()
+		if j.p.writer != nil {
+			_ = j.p.writer.Close()
+			j.p.writer = nil
+		}
+		j.p.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(150 * time.Millisecond):
+		}
+	}
 	return fmt.Sprintf("kafka-%d", job.EnqueuedAt), err
 }
 
@@ -310,11 +380,35 @@ type topicsCap struct{ p *Provider }
 
 func (t *topicsCap) Name() string { return "kafka" }
 func (t *topicsCap) Publish(ctx context.Context, topic string, payload interface{}) (string, error) {
+	full := t.p.prefix + ".topic." + topic
+	if err := t.p.ensureTopic(ctx, full); err != nil {
+		return "", err
+	}
 	body, _ := json.Marshal(map[string]interface{}{"payload": payload, "publishedAt": time.Now().UnixMilli(), "deliveryCount": 1})
-	err := t.p.getWriter().WriteMessages(ctx, kafka.Message{Topic: t.p.prefix + ".topic." + topic, Value: body})
+	var err error
+	for attempt := 0; attempt < 8; attempt++ {
+		err = t.p.getWriter().WriteMessages(ctx, kafka.Message{Topic: full, Value: body})
+		if err == nil {
+			break
+		}
+		if !strings.Contains(err.Error(), "Unknown Topic") && !strings.Contains(err.Error(), "Leader Not Available") {
+			break
+		}
+		t.p.mu.Lock()
+		if t.p.writer != nil {
+			_ = t.p.writer.Close()
+			t.p.writer = nil
+		}
+		t.p.mu.Unlock()
+		time.Sleep(150 * time.Millisecond)
+	}
 	return strconv.FormatInt(time.Now().UnixMilli(), 10), err
 }
 func (t *topicsCap) Subscribe(ctx context.Context, opts backstage.TopicSubscribeOptions, onMessage func(context.Context, backstage.TopicDelivery) error) (backstage.Subscription, error) {
+	full := t.p.prefix + ".topic." + opts.Topic
+	if err := t.p.ensureTopic(ctx, full); err != nil {
+		return nil, err
+	}
 	stopCtx, cancel := context.WithCancel(ctx)
 	var running atomic.Bool
 	running.Store(true)
@@ -324,6 +418,8 @@ func (t *topicsCap) Subscribe(ctx context.Context, opts backstage.TopicSubscribe
 		defer wg.Done()
 		t.subscribeLoop(stopCtx, &running, opts, onMessage)
 	}()
+	// Allow consumer group to join before Publish(from=latest) races.
+	time.Sleep(500 * time.Millisecond)
 	return &sub{stop: func() {
 		running.Store(false)
 		cancel()
@@ -476,6 +572,40 @@ func (t *contiguousTracker) contiguous() int64 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.highest
+}
+
+
+func (p *Provider) ensureTopic(ctx context.Context, topic string) error {
+	conn, err := kafka.Dial("tcp", p.brokers[0])
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	controller, err := conn.Controller()
+	if err != nil {
+		return err
+	}
+	cconn, err := kafka.Dial("tcp", fmt.Sprintf("%s:%d", controller.Host, controller.Port))
+	if err != nil {
+		return err
+	}
+	defer cconn.Close()
+	_ = cconn.CreateTopics(kafka.TopicConfig{Topic: topic, NumPartitions: 1, ReplicationFactor: 1})
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		parts, err := cconn.ReadPartitions(topic)
+		if err == nil && len(parts) > 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("topic %s not ready: %v", topic, err)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 func max(a, b int) int {

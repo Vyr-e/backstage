@@ -116,6 +116,17 @@ export class KafkaProvider implements BackstageProvider {
             },
           ]);
           await admin.createTopics({ topics, waitForLeaders: true });
+          // Extra metadata wait — waitForLeaders can still race with produce.
+          const names = topics.map((t) => t.topic);
+          const deadline = Date.now() + 15_000;
+          while (Date.now() < deadline) {
+            const meta = await admin.fetchTopicMetadata({ topics: names });
+            const ready = names.every((n) =>
+              meta.topics.some((t: any) => t.name === n && !t.error && t.partitions?.length),
+            );
+            if (ready) break;
+            await Bun.sleep(100);
+          }
         } finally {
           await admin.disconnect();
         }
