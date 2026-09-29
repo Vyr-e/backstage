@@ -61,6 +61,45 @@ function buildUrl(cfg: RedisStreamsProviderConfig): string {
 const ACK_BATCH_SIZE = 100;
 const ACK_FLUSH_INTERVAL_MS = 50;
 
+/**
+ * A connection of its own for one XREADGROUP ... BLOCK loop. Redis answers a
+ * connection's commands in order, so a blocked read on the shared connection
+ * would stall every publish, ack and other read behind it.
+ */
+class BlockingReader {
+  private constructor(
+    readonly client: RedisClient,
+    private readonly clientId: string,
+    private readonly control: RedisClient,
+  ) {}
+
+  static async open(shared: RedisClient): Promise<BlockingReader> {
+    const client = await shared.duplicate();
+    const clientId = String(await client.send('CLIENT', ['ID']));
+    return new BlockingReader(client, clientId, shared);
+  }
+
+  /**
+   * Wait for `loop` to exit, ending any pending BLOCK early. CLIENT UNBLOCK
+   * makes the read return as if it timed out, so no entry is handed to a
+   * consumer that is going away. Where UNBLOCK is not permitted the loop
+   * still exits when its BLOCK times out.
+   */
+  async stop(loop: Promise<void>): Promise<void> {
+    let done = false;
+    void loop.finally(() => {
+      done = true;
+    });
+    while (!done) {
+      await this.control
+        .send('CLIENT', ['UNBLOCK', this.clientId])
+        .catch(() => {});
+      await Promise.race([loop, Bun.sleep(50)]);
+    }
+    this.client.close();
+  }
+}
+
 /** Batched XACK (+ optional XDEL) flusher shared by a consume subscription. */
 class AckBatcher {
   private pending = new Map<string, string[]>();
@@ -237,6 +276,7 @@ export class RedisStreamsProvider implements BackstageProvider {
         let gotMessages = false;
         const active = new Set<Promise<void>>();
         const acks = new AckBatcher(self.redis, opts.group, self.deleteOnAck);
+        const reader = await BlockingReader.open(self.redis);
 
         const reclaimTimer = setInterval(() => {
           if (!running) return;
@@ -269,8 +309,7 @@ export class RedisStreamsProvider implements BackstageProvider {
               }
               args.push('STREAMS', ...keys, ...ids);
 
-              const result = await self.redis.send('XREADGROUP', args);
-              if (!running) break;
+              const result = await reader.client.send('XREADGROUP', args);
               const entries = normalizeXReadGroup(result);
               if (entries.length === 0) {
                 gotMessages = false;
@@ -311,8 +350,7 @@ export class RedisStreamsProvider implements BackstageProvider {
             running = false;
             clearInterval(reclaimTimer);
             // Do not wait on in-flight handlers — Worker applies gracePeriod.
-            // Give the read loop a moment to exit the BLOCK, then flush ACKs.
-            await Promise.race([loop, Bun.sleep(Math.min(self.blockTimeout, 500) + 50)]);
+            await reader.stop(loop);
             await acks.close();
           },
         };
@@ -645,12 +683,13 @@ export class RedisStreamsProvider implements BackstageProvider {
           : topicFanoutGroup(opts.consumerId);
         const start = opts.from === 'earliest' ? '0' : '$';
         await self.ensureGroup(key, group, start);
+        const reader = await BlockingReader.open(self.redis);
 
         let running = true;
         const loop = (async () => {
           while (running) {
             try {
-              const result = await self.redis.send('XREADGROUP', [
+              const result = await reader.client.send('XREADGROUP', [
                 'GROUP',
                 group,
                 opts.consumerId,
@@ -662,7 +701,6 @@ export class RedisStreamsProvider implements BackstageProvider {
                 key,
                 '>',
               ]);
-              if (!running) break;
               const entries = normalizeXReadGroup(result);
               for (const [, messages] of entries) {
                 if (!Array.isArray(messages)) continue;
@@ -704,10 +742,7 @@ export class RedisStreamsProvider implements BackstageProvider {
             running = false;
             clearInterval(reclaimTimer);
             clearInterval(cleanupTimer);
-            await Promise.race([
-              loop,
-              Bun.sleep(Math.max(self.blockTimeout, 500) + 100),
-            ]);
+            await reader.stop(loop);
           },
         };
       },
