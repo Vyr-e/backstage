@@ -62,7 +62,7 @@
   },
   "scripts": {
     "dev": "bun run src/cli.ts",
-    "build": "bun build ./src/index.ts ./src/core.ts ./src/worker.ts ./src/queue.ts ./src/scheduler.ts ./src/reclaimer.ts ./src/types.ts ./src/testing/index.ts ./src/provider/rabbitmq/index.ts ./src/provider/kafka/index.ts --outdir ./dist --target bun && tsc --project tsconfig.build.json --emitDeclarationOnly --outDir ./dist",
+    "build": "bun build ./src/index.ts ./src/core.ts ./src/worker.ts ./src/queue.ts ./src/scheduler.ts ./src/reclaimer.ts ./src/types.ts ./src/testing/index.ts ./src/provider/rabbitmq/index.ts ./src/provider/kafka/index.ts --outdir ./dist --target bun --root ./src --external kafkajs --external amqplib && tsc --project tsconfig.build.json --emitDeclarationOnly --outDir ./dist --rootDir ./src",
     "test": "bun test",
     "run-workers": "bun run src/cli.ts run-workers",
     "run-scheduler": "bun run src/cli.ts run-scheduler",
@@ -75,10 +75,8 @@
     "typescript": "^5.0.0"
   },
   "peerDependencies": {
-    "typescript": "^5",
-    "bun": ">=1.0.0",
-    "amqplib": "",
-    "kafkajs": ""
+    "amqplib": "^0.10.0",
+    "kafkajs": "^2.0.0"
   },
   "engines": {
     "bun": ">=1.0.0"
@@ -91,12 +89,6 @@
       "optional": true
     },
     "kafkajs": {
-      "optional": true
-    },
-    "typescript": {
-      "optional": false
-    },
-    "bun": {
       "optional": true
     }
   }
