@@ -14,12 +14,15 @@ import (
 )
 
 type Config struct {
+	// NativeDelays requires RabbitMQ 4.4+ and uses quorum job queues.
+	NativeDelays  bool
 	URL           string
 	Prefix        string
 	MaxDeliveries int
 }
 
 type Provider struct {
+	nativeDelays  bool
 	name          string
 	url           string
 	prefix        string
@@ -51,7 +54,7 @@ func New(cfg Config) *Provider {
 		maxD = 5
 	}
 	p := &Provider{
-		name: "rabbitmq", url: url, prefix: prefix, maxDeliveries: maxD,
+		name: "rabbitmq", url: url, prefix: prefix, maxDeliveries: maxD, nativeDelays: cfg.NativeDelays,
 		boundQueues: make(map[string]struct{}),
 	}
 	p.jobs = &jobsCap{p: p}
@@ -69,6 +72,18 @@ func (p *Provider) Init(ctx context.Context, pctx backstage.ProviderContext) err
 	p.ctx = &pctx
 	if err := p.connect(); err != nil {
 		return err
+	}
+	if p.nativeDelays {
+		version, _ := p.conn.Properties["version"].(string)
+		var major, minor int
+		if _, err := fmt.Sscanf(version, "%d.%d", &major, &minor); err != nil || (major < 4 || (major == 4 && minor < 4)) {
+			return fmt.Errorf("native delays require RabbitMQ 4.4+, connected to %q", version)
+		}
+		p.delays = &delayedDelays{p: p}
+		if pctx.Capabilities.Delays != nil {
+			p.delays = pctx.Capabilities.Delays
+		}
+		return nil
 	}
 	p.mu.Lock()
 	ch := p.pub
@@ -229,6 +244,13 @@ func (p *Provider) Close() error {
 	return err
 }
 
+func (p *Provider) jobQueueArgs() amqp.Table {
+	if p.nativeDelays {
+		return amqp.Table{"x-queue-type": "quorum"}
+	}
+	return nil
+}
+
 func (p *Provider) q(name string) string   { return p.prefix + "." + name }
 func (p *Provider) dlq(name string) string { return p.prefix + "." + name + ".dead-letter" }
 
@@ -245,20 +267,26 @@ func (j *jobsCap) EnsureQueues(ctx context.Context, queues []string) error {
 		return err
 	}
 	for _, q := range queues {
-		if _, err := ch.QueueDeclare(j.p.q(q), true, false, false, false, nil); err != nil {
+		j.p.mu.Lock()
+		_, ready := j.p.boundQueues[q]
+		j.p.mu.Unlock()
+		if j.p.nativeDelays && ready {
+			continue
+		}
+		if _, err := ch.QueueDeclare(j.p.q(q), true, false, false, false, j.p.jobQueueArgs()); err != nil {
 			return err
 		}
-		if _, err := ch.QueueDeclare(j.p.dlq(q), true, false, false, false, nil); err != nil {
+		if _, err := ch.QueueDeclare(j.p.dlq(q), true, false, false, false, j.p.jobQueueArgs()); err != nil {
 			return err
 		}
 		if j.p.delayedReady {
 			if err := ch.QueueBind(j.p.q(q), q, j.p.prefix+".delayed", false, nil); err != nil {
 				return err
 			}
-			j.p.mu.Lock()
-			j.p.boundQueues[q] = struct{}{}
-			j.p.mu.Unlock()
 		}
+		j.p.mu.Lock()
+		j.p.boundQueues[q] = struct{}{}
+		j.p.mu.Unlock()
 	}
 	return nil
 }
@@ -273,6 +301,11 @@ type wireJob struct {
 }
 
 func (j *jobsCap) Publish(ctx context.Context, job backstage.OutgoingJob) (string, error) {
+	if j.p.nativeDelays {
+		if err := j.EnsureQueues(ctx, []string{job.Queue}); err != nil {
+			return "", err
+		}
+	}
 	payload, err := backstage.EncodePayload(job.Payload)
 	if err != nil {
 		return "", err
@@ -353,7 +386,7 @@ func (j *jobsCap) consumeLoop(ctx context.Context, running *atomic.Bool, opts ba
 		var feeds []tagged
 		ok := true
 		for _, q := range opts.Queues {
-			_, _ = ch.QueueDeclare(j.p.q(q), true, false, false, false, nil)
+			_, _ = ch.QueueDeclare(j.p.q(q), true, false, false, false, j.p.jobQueueArgs())
 			ds, err := ch.Consume(j.p.q(q), opts.ConsumerID+"-"+q, false, false, false, false, nil)
 			if err != nil {
 				ok = false
@@ -527,6 +560,16 @@ func (d *delayedDelays) Schedule(ctx context.Context, job backstage.OutgoingJob,
 	})
 	if err != nil {
 		return "", err
+	}
+	if d.p.nativeDelays {
+		if err := d.p.jobs.EnsureQueues(ctx, []string{job.Queue}); err != nil {
+			return "", err
+		}
+		err = d.p.publishConfirmed(ctx, "", d.p.q(job.Queue), amqp.Publishing{
+			DeliveryMode: amqp.Persistent, Body: body,
+			Headers: amqp.Table{"x-opt-delivery-time": runAt},
+		})
+		return fmt.Sprintf("scheduled:%d", runAt), err
 	}
 	// Bind once via ensureQueues; schedule only publishes.
 	d.p.mu.Lock()

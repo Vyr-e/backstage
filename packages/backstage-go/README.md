@@ -157,6 +157,20 @@ client.Subscribe("ride.cancelled", handler, backstage.WithGroup("billing"))
 client.Capabilities()
 ```
 
+RabbitMQ 4.4+ can handle jobs, topics and delays with one provider:
+
+```go
+client := backstage.New(backstage.Config{
+  Provider: rabbitmq.New(rabbitmq.Config{URL: amqpURL, NativeDelays: true}),
+})
+```
+
+`NativeDelays` declares quorum job/dead-letter queues and publishes scheduled jobs
+with an `x-opt-delivery-time` int64 header. It rejects brokers older than 4.4.
+No delayed-message plugin or Redis delay store is needed. Drain/migrate existing
+classic queues first, or use a new prefix. The default still supports the previous
+plugin/plugged-delays path. Optional dedupe can be a plain Redis SET NX adapter.
+
 RabbitMQ and Kafka ship as separate modules under `providers/`. Core keeps only `go-redis`.
 Legacy Broadcast is Redis-only and deprecated in favor of topics.
 See `docs/providers/`.

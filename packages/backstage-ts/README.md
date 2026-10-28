@@ -214,8 +214,15 @@ import { KafkaProvider } from '@vyr-e/backstage/kafka';
 // Redis (default)
 new Worker({ host: 'localhost', port: 6379 });
 
-// RabbitMQ (peer: amqplib)
-new Worker({ provider: new RabbitMQProvider({ url: 'amqp://localhost' }) });
+// RabbitMQ 4.4+ (peer: amqplib): one provider for jobs, topics and delays.
+new Worker({
+  provider: new RabbitMQProvider({ url: 'amqp://localhost', nativeDelays: true }),
+});
+// nativeDelays declares quorum job/dead-letter queues and schedules with the
+// x-opt-delivery-time int64 header. No delayed-message plugin or Redis required.
+// Existing classic queues must be drained/migrated first (or use a new prefix).
+// Without nativeDelays, the existing delayed-plugin/plugged-delays path remains.
+// Dedupe is optional and separate: inject a plain Redis SET NX PX adapter if needed.
 
 // Kafka (peer: kafkajs) — plug delays/dedupe as needed
 // Defaults: 3 partitions, replicationFactor 3. Use 1/1 for single-broker tests.

@@ -14,6 +14,8 @@ import type {
 
 export interface RabbitMQProviderConfig {
   url?: string;
+  /** RabbitMQ 4.4+ native delayed delivery; uses quorum job queues. */
+  nativeDelays?: boolean;
   prefix?: string;
   /** Prefetch default when consume opts omit. */
   prefetch?: number;
@@ -22,6 +24,7 @@ export interface RabbitMQProviderConfig {
 }
 
 type AmqpConn = {
+  connection: { serverProperties: { version?: string } };
   createChannel(): Promise<AmqpChan>;
   createConfirmChannel(): Promise<AmqpConfirmChan>;
   close(): Promise<void>;
@@ -74,7 +77,8 @@ interface WireJob {
 /**
  * RabbitMQ transport: durable queues, publisher confirms, basic.consume + qos.
  * jobs.requires = ['delays'] for retries. Provides topics; no dedupe.
- * Delays: uses rabbitmq_delayed_message_exchange when detected in init,
+ * Delays: nativeDelays uses quorum queues on RabbitMQ 4.4+. Otherwise uses
+ * rabbitmq_delayed_message_exchange when detected in init,
  * otherwise requires a plugged DelaysCapability.
  */
 export class RabbitMQProvider implements BackstageProvider {
@@ -84,6 +88,7 @@ export class RabbitMQProvider implements BackstageProvider {
   delays?: DelaysCapability;
 
   readonly requiresDelays = true;
+  private readonly nativeDelays: boolean;
   private readonly url: string;
   private readonly prefix: string;
   private readonly maxDeliveries: number;
@@ -97,6 +102,7 @@ export class RabbitMQProvider implements BackstageProvider {
   private connectPromise: Promise<void> | null = null;
 
   constructor(config: RabbitMQProviderConfig = {}) {
+    this.nativeDelays = config.nativeDelays ?? false;
     this.url = config.url ?? 'amqp://guest:guest@localhost:5672';
     this.prefix = config.prefix ?? 'backstage';
     this.maxDeliveries = config.maxDeliveries ?? 5;
@@ -108,6 +114,15 @@ export class RabbitMQProvider implements BackstageProvider {
     this.ctx = ctx;
     this.closed = false;
     await this.ensureConn();
+    if (this.nativeDelays) {
+      const version = this.conn?.connection.serverProperties.version ?? '';
+      const [major = 0, minor = 0] = version.split('.').map(Number);
+      if (!(major > 4 || (major === 4 && minor >= 4))) {
+        throw new Error(`Native delays require RabbitMQ 4.4+, connected to ${version || 'unknown version'}`);
+      }
+      this.delays = ctx.capabilities.delays ?? this.createBuiltinDelays();
+      return;
+    }
     try {
       const ch = await this.conn!.createChannel();
       await ch.assertExchange(`${this.prefix}.delayed`, 'x-delayed-message', {
@@ -194,6 +209,12 @@ export class RabbitMQProvider implements BackstageProvider {
     await ch.waitForConfirms();
   }
 
+  private jobQueueOptions(): object {
+    return this.nativeDelays
+      ? { durable: true, arguments: { 'x-queue-type': 'quorum' } }
+      : { durable: true };
+  }
+
   private qName(queue: string): string {
     return `${this.prefix}.${queue}`;
   }
@@ -207,20 +228,23 @@ export class RabbitMQProvider implements BackstageProvider {
       name: 'rabbitmq',
       requires: ['delays'],
       async ensureQueues(queues: string[]): Promise<void> {
+        const pending = queues.filter((q) => !self.nativeDelays || !self.boundQueues.has(q));
+        if (pending.length === 0) return;
         await self.ensureConn();
         const ch = await self.conn!.createChannel();
         const exchange = `${self.prefix}.delayed`;
-        for (const q of queues) {
-          await ch.assertQueue(self.qName(q), { durable: true });
-          await ch.assertQueue(self.dlqName(q), { durable: true });
+        for (const q of pending) {
+          await ch.assertQueue(self.qName(q), self.jobQueueOptions());
+          await ch.assertQueue(self.dlqName(q), self.jobQueueOptions());
           if (self.delayedExchangeReady) {
             await ch.bindQueue(self.qName(q), exchange, q);
-            self.boundQueues.add(q);
           }
+          self.boundQueues.add(q);
         }
         await ch.close();
       },
       async publish(job: OutgoingJob): Promise<string> {
+        if (self.nativeDelays) await self.jobs.ensureQueues([job.queue]);
         const body: WireJob = {
           queue: job.queue,
           taskName: job.taskName,
@@ -252,8 +276,8 @@ export class RabbitMQProvider implements BackstageProvider {
               const ch = await self.conn!.createChannel();
               await ch.prefetch(opts.prefetch);
               for (const q of opts.queues) {
-                await ch.assertQueue(self.qName(q), { durable: true });
-                await ch.assertQueue(self.dlqName(q), { durable: true });
+                await ch.assertQueue(self.qName(q), self.jobQueueOptions());
+                await ch.assertQueue(self.dlqName(q), self.jobQueueOptions());
               }
               let channelDead = false;
               ch.on('error', () => {
@@ -397,6 +421,15 @@ export class RabbitMQProvider implements BackstageProvider {
           meta: job.meta,
           deliveryCount: job.deliveryCount ?? 1,
         };
+        if (self.nativeDelays) {
+          await self.jobs.ensureQueues([job.queue]);
+          await self.publishConfirmed('', self.qName(job.queue), Buffer.from(JSON.stringify(body)), {
+            persistent: true,
+            // Force an AMQP signed 64-bit integer (a timestamp exceeds int32).
+            headers: { 'x-opt-delivery-time': { '!': 'long', value: runAt } },
+          });
+          return `scheduled:${runAt}`;
+        }
         const exchange = `${self.prefix}.delayed`;
         // Bind once in ensureQueues; only bind here if queue was not prepared.
         if (!self.boundQueues.has(job.queue)) {
