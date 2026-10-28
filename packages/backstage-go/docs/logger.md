@@ -1,6 +1,6 @@
 # Logger
 
-Backstage uses Go's slog for structured logging.
+Backstage uses Go's slog for structured JSON logging. Each log entry is one JSON line, so you can pipe Backstage output to `jq` when the host application also writes JSON lines.
 
 ## Default
 
@@ -43,7 +43,7 @@ logger := backstage.NewLogger("Worker", backstage.LoggerConfig{
 
 ```go
 logger.Info("Processing order", "orderId", "123", "amount", 99.99)
-// Output: time=... level=INFO component=Worker msg="Processing order" orderId=123 amount=99.99
+// Output: {"time":"...","level":"INFO","msg":"Processing order","component":"Worker","orderId":"123","amount":99.99}
 ```
 
 ## Child Logger
@@ -53,7 +53,7 @@ Add context with `.With()`:
 ```go
 reqLogger := logger.With("request_id", "abc123")
 reqLogger.Info("Handling request")
-// Output: ... component=Worker request_id=abc123 msg="Handling request"
+// Output: {"time":"...","level":"INFO","msg":"Handling request","component":"Worker","request_id":"abc123"}
 ```
 
 ## Context-Aware

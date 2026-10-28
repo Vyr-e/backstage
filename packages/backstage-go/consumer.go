@@ -3,7 +3,6 @@ package backstage
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"sync"
@@ -75,13 +74,16 @@ func (c *Client) Start(ctx context.Context, cfg ConsumerConfig) error {
 	}
 
 	c.logger.Info("Worker starting", "id", c.config.WorkerID)
-	c.logger.Info("\n" + FormatCapabilityReport(c.Capabilities()))
+	report := c.Capabilities()
+	c.logger.Info("Worker capabilities", "provider", report.Provider,
+		"jobs", report.Jobs, "topics", report.Topics,
+		"delays", report.Delays, "dedupe", report.Dedupe)
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		<-sigChan
-		log.Println("[Backstage] Shutting down...")
+		c.logger.Info("Shutting down")
 		c.Stop()
 	}()
 
@@ -179,7 +181,7 @@ func (c *Client) onJobDelivery(ctx context.Context, d JobDelivery) error {
 
 	handler, ok := c.handlers[d.TaskName()]
 	if !ok {
-		log.Printf("[Backstage] Unknown task: %s", d.TaskName())
+		c.logger.Warn("Unknown task", "task", d.TaskName())
 		return d.Ack(ctx)
 	}
 
@@ -198,11 +200,11 @@ func (c *Client) onJobDelivery(ctx context.Context, d JobDelivery) error {
 			_, err = c.Enqueue(ctx, result.Next, result.Payload)
 		}
 		if err != nil {
-			log.Printf("[Backstage] Chaining failed: %s - %v", d.TaskName(), err)
+			c.logger.Error("Chaining failed", "task", d.TaskName(), "error", err)
 		}
 	}
 	if err != nil {
-		log.Printf("[Backstage] Task failed: %s - %v", d.TaskName(), err)
+		c.logger.Error("Task failed", "task", d.TaskName(), "error", err)
 		max := c.consumerCfg.MaxDeliveries
 		if d.Meta().Attempts > 0 {
 			max = d.Meta().Attempts

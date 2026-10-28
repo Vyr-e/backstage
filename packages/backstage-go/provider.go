@@ -149,10 +149,10 @@ type Capabilities struct {
 }
 
 type CapabilityReportEntry struct {
-	Available bool
-	Name      string
-	Source    string
-	Hint      string
+	Available bool   `json:"available"`
+	Name      string `json:"name,omitempty"`
+	Source    string `json:"source"`
+	Hint      string `json:"hint,omitempty"`
 }
 
 type CapabilityReport struct {

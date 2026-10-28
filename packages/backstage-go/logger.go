@@ -40,9 +40,9 @@ func NewLogger(prefix string, config ...LoggerConfig) *Logger {
 	var slogHandler slog.Handler
 
 	if cfg.Silent && cfg.Handler == nil {
-		slogHandler = slog.NewTextHandler(io.Discard, opts)
+		slogHandler = slog.NewJSONHandler(io.Discard, opts)
 	} else {
-		slogHandler = slog.NewTextHandler(output, opts)
+		slogHandler = slog.NewJSONHandler(output, opts)
 	}
 
 	return &Logger{
