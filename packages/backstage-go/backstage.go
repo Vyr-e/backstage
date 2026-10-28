@@ -236,7 +236,12 @@ func (c *Client) RegisterQueue(name string) {
 }
 
 // LogQueues periodically logs statistics for all registered queues.
+// It reads Redis stream lengths, so it is a no-op on non-Redis providers.
 func (c *Client) LogQueues(ctx context.Context, interval time.Duration) {
+	if c.redis == nil {
+		c.logger.Warn("LogQueues is only available with RedisStreamsProvider; skipping")
+		return
+	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 

@@ -4,6 +4,7 @@ package backstage
 
 import (
 	"context"
+	"errors"
 	"strconv"
 
 	"github.com/redis/go-redis/v9"
@@ -47,6 +48,9 @@ type QueuesInfo struct {
 
 // Inspect retrieves current statistics for the provided list of queues.
 func Inspect(ctx context.Context, rdb *redis.Client, queues []*Queue) (*QueuesInfo, error) {
+	if rdb == nil {
+		return nil, errors.New("backstage: Inspect requires a Redis client")
+	}
 	info := &QueuesInfo{}
 
 	for _, q := range queues {
